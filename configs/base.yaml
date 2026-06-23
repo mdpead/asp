@@ -1,0 +1,42 @@
+name: base
+seed: 0
+
+model:
+  d_model: 512
+  num_heads: 8
+  max_length: 256
+  d_ff: 2048
+  num_enc_layers: 6
+  num_dec_layers: 6
+  dropout: 0.1
+
+train:
+  effective_batch_token_size: 25000
+  minibatch_token_size: 4096
+  learning_rate: 1.0e-3  # 1 / sqrt(d_model * warm_up_steps)
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1.0e-9
+  num_steps: 50000
+  label_smoothing: 0.1
+  device: cuda
+  checkpoint_steps: 1000
+  warm_up_steps: 2000
+  validation_steps: 1000
+  validation_batches: 10
+  num_workers: 0
+  cache_clear_steps: 100
+  compile_model: false
+
+data:
+  train:
+    ds: techiaith/cardiff-university-tm-en-cy
+    test_split_ratio: 0.1
+
+tokenizer:
+  vocab_size: 16000
+  pad_token_id: 2
+  training_size: null
+
+locations:
+  data_dir: ./data
+  models_dir: ./runs
