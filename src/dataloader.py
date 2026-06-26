@@ -1,8 +1,32 @@
 from torch.utils.data import DataLoader, IterableDataset
 import torch
-from torch.utils.data.sampler import BatchSampler
+from torch.utils.data.sampler import BatchSampler, Sampler
+import numpy as np
 import random
 from functools import partial
+
+
+class InfiniteRandomSampler(Sampler):
+    def __init__(self, data_source, seed, start_index=0):
+        self.n = len(data_source)
+        self.seed = seed
+        self.start_index = start_index
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed)
+        # Fast-forward whole epochs without yielding, keeping the RNG in sync
+        skip = self.start_index
+        while skip >= self.n:
+            rng.permutation(self.n)
+            skip -= self.n
+        first = True
+        while True:
+            order = rng.permutation(self.n)
+            if first:
+                order = order[skip:]
+                first = False
+            yield from (int(i) for i in order)
+
 
 class TokenSampler(BatchSampler):
     def __init__(self, ds, token_batch_size, seed):
@@ -73,9 +97,20 @@ def collate_batch(batch, pad_token_id):
 
 
 
+def collate_lm_batch(batch, pad_token_id):
+    input_ids = torch.stack(batch)
+    padding_mask = (input_ids != pad_token_id).bool()
+    return {
+        "input_ids": input_ids[:, :-1],
+        "padding_mask": padding_mask[:, :-1],
+        "output_ids": input_ids[:, 1:],
+    }
+
+
 def create_dataloaders(
     stage,
     ds,
+    tokenizer,
     config,
 ):
 
@@ -86,6 +121,9 @@ def create_dataloaders(
 
     dataloaders = {}
     for split in ds:
+        split_num_workers = 0 if split == "test" else num_workers
+        split_prefetch_factor = None if split_num_workers == 0 else prefetch_factor
+
         if sampler_name:
             sampler_cls = SAMPLERS.get(sampler_name)
             if sampler_cls is None:
@@ -95,18 +133,21 @@ def create_dataloaders(
                 batch_sampler=sampler_cls(
                     ds[split], train_config["minibatch_token_size"], config["seed"]
                 ),
-                collate_fn=partial(collate_batch, pad_token_id=config["tokenizer"]["pad_token_id"]),
+                collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id),
                 pin_memory=True,
-                num_workers=num_workers,
-                prefetch_factor=prefetch_factor,
+                num_workers=split_num_workers,
+                prefetch_factor=split_prefetch_factor,
             )
         else:
             batch_size = train_config["minibatch_token_size"] // config["model"]["max_length"]
+            sampler = InfiniteRandomSampler(ds[split], config["seed"]) if split == "train" else None
             dataloaders[split] = DataLoader(
                 ds[split],
                 batch_size=batch_size,
+                sampler=sampler,
+                collate_fn=partial(collate_lm_batch, pad_token_id=tokenizer.pad_token_id),
                 pin_memory=True,
-                num_workers=num_workers,
-                prefetch_factor=prefetch_factor,
+                num_workers=split_num_workers,
+                prefetch_factor=split_prefetch_factor,
             )
     return dataloaders

@@ -24,7 +24,7 @@ token = tokenizer.get_tokenizer(ds_raw, config)
 
 ds = data.prepare_dataset("pretrain", ds_raw, token, config)
 
-dataloaders = dataloader.create_dataloaders("pretrain", ds, config)
+dataloaders = dataloader.create_dataloaders("pretrain", ds, token, config)
 
 transformer = model.build_transformer(config)
 
