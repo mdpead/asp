@@ -1,25 +1,14 @@
 from torch import nn
 import torch
 import math
-
-
-class Linear(nn.Module):
-    def __init__(self, in_features, out_features):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features))
-        self.bias = nn.Parameter(torch.zeros(out_features))
-        nn.init.xavier_uniform_(self.weight)
-
-    def forward(self, x):
-        x = torch.matmul(x, self.weight.t()) + self.bias
-        return x
+from src.kernels import flash_attention
 
 
 class PositionWiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff, dropout):
         super().__init__()
-        self.linear1 = Linear(d_model, d_ff)
-        self.linear2 = Linear(d_ff, d_model)
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
         self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -59,10 +48,10 @@ class MultiHeadAttention(nn.Module):
         assert d_model % num_heads == 0
         self.num_heads = num_heads
         self.d_h = d_model // num_heads
-        self.W_q = Linear(d_model, d_model)
-        self.W_k = Linear(d_model, d_model)
-        self.W_v = Linear(d_model, d_model)
-        self.W_o = Linear(d_model, d_model)
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, q, k, v, attn_mask):
@@ -93,37 +82,101 @@ class MultiHeadAttention(nn.Module):
 
         return O
 
+
 class FusedQKVMultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads, d_h, dropout):
+    def __init__(self, d_model, num_heads, d_h, dropout, rope_layer):
         super().__init__()
         self.num_heads = num_heads
         self.d_h = d_h
-        self.W_qkv = Linear(d_model, num_heads * 3 * d_h)
-        self.W_o = Linear(num_heads * d_h, d_model)
+        self.W_qkv = nn.Linear(d_model, num_heads * 3 * d_h)
+        self.W_o = nn.Linear(num_heads * d_h, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.rope = rope_layer
 
-    def forward(self, x, attn_mask):
+    def forward(self, x):
 
         # Create Q, K, V tensors in a fused manner
-        QKV = self.W_qkv(x).reshape(x.shape[0], x.shape[1], self.num_heads, 3, self.d_h).permute(0, 2, 3, 1, 4)  # (batch, num_heads, 3, seq_len, d_h)
+        QKV = (
+            self.W_qkv(x)
+            .reshape(x.shape[0], x.shape[1], self.num_heads, 3, self.d_h)
+            .permute(0, 2, 3, 1, 4)
+        )  # (batch, num_heads, 3, seq_len, d_h)
         Q, K, V = QKV.unbind(dim=2)  # (batch, num_heads, seq_len, d_h)
 
-        # Calculate attention matrices
-        attn_raw = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.d_h)
-        attn_mask_mh = attn_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-        fill_value = torch.finfo(attn_raw.dtype).min  # works for fp16/bf16/fp32
-        attn_masked = attn_raw.masked_fill(~attn_mask_mh, fill_value)
-        attn = torch.softmax(attn_masked, -1) # (batch, num_heads, seq_len, seq_len)
-        attn = self.dropout(attn)
+        # Apply RoPE
+        Q, K = self.rope(Q, K)
 
-        # Apply to value vectors and recombine
-        A = torch.matmul(attn, V)  # (batch, num_heads, seq_len, d_h)
-        A = A.permute(0, 2, 1, 3).reshape(A.shape[0], A.shape[2], -1)  # (batch, seq_len, num_heads * d_h)
+        # Apply flash attention kernel
+        attn_mh = flash_attention(Q, K, V, causal=True)  # (batch, num_heads, seq_len, d_h)
 
         # Project out
-        O = self.W_o(A)  # (batch, seq_len, d_model)
+        attn_flat = attn_mh.permute(0, 2, 1, 3).reshape(attn_mh.shape[0], attn_mh.shape[2], -1)
+        O = self.W_o(attn_flat)  # (batch, seq_len, d_model)
 
         return O
+
+
+class RotaryPositionalEncoding(nn.Module):
+    def __init__(self, d_h, max_length):
+        super().__init__()
+        cos_thetas, sin_thetas = self.create_ang_trigs(d_h, max_length)
+        self.register_buffer("cos_thetas", cos_thetas, persistent=False)
+        self.register_buffer("sin_thetas", sin_thetas, persistent=False)
+
+    @staticmethod
+    def create_ang_trigs(d_h, max_length):
+        base = 10000
+
+        ws = []
+        for i in range(0, d_h // 2):
+            w_i = base ** (-2 * i / d_h)
+            ws.append(w_i)
+        ws = torch.tensor(ws, dtype=torch.float32)
+
+        # Calculate the rotation angle for each pair
+        positions = torch.arange(max_length)
+        thetas = positions[:, None] * ws[None, :]  # (seq, d_h/2)
+
+        # Calculate the trig components needed
+        cos_thetas = torch.cos(thetas)
+        sin_thetas = torch.sin(thetas)
+
+        return cos_thetas, sin_thetas
+
+    @staticmethod
+    def rotate(x, cos_thetas, sin_thetas):
+        cos_thetas = cos_thetas.to(x.dtype)
+        sin_thetas = sin_thetas.to(x.dtype)
+
+        # Apply the rotations to each pair
+        x1 = x[..., 0::2]  # (b, h, seq, d_h/2)
+        x2 = x[..., 1::2]  # (b, h, seq, d_h/2)
+
+        out1 = x1 * cos_thetas - x2 * sin_thetas  # (b, h, seq, d_h/2)
+        out2 = x1 * sin_thetas + x2 * cos_thetas  # (b, h, seq, d_h/2)
+
+        # Interleave back together
+        out = torch.stack([out1, out2], dim=-1).flatten(-2)  # (b, h, seq, d_h)
+
+        return out
+
+    def forward(self, Q, K):
+
+        seq_length = Q.shape[-2]
+
+        if seq_length > self.cos_thetas.shape[0]:
+            raise ValueError(
+                f"seq_length {seq_length} exceeds max_length {self.cos_thetas.shape[0]}"
+            )
+
+        cos_thetas = self.cos_thetas[0:seq_length]
+        sin_thetas = self.sin_thetas[0:seq_length]
+
+        Q_rot = self.rotate(Q, cos_thetas, sin_thetas)
+        K_rot = self.rotate(K, cos_thetas, sin_thetas)
+
+        return Q_rot, K_rot
+
 
 class Embedding(nn.Module):
     def __init__(self, vocab_size, d_model):
@@ -136,81 +189,43 @@ class Embedding(nn.Module):
         return x
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_length):
-        super().__init__()
-        self.register_buffer("PE", self.create_pe(d_model, max_length))
-
-    def create_pe(self, d_model, max_length):
-        PE = torch.zeros((max_length, d_model))
-        positions = torch.arange(0, max_length)
-        dims = torch.arange(0, d_model // 2)
-
-        evens = torch.sin(positions.unsqueeze(-1) / (10000 ** (2 * dims / d_model)).unsqueeze(0))
-        odds = torch.cos(positions.unsqueeze(-1) / (10000 ** (2 * dims / d_model)).unsqueeze(0))
-
-        PE[:, 0::2] = evens
-        PE[:, 1::2] = odds
-
-        return PE
-
-    def forward(self, x):
-        x = x + self.PE[: x.shape[1], :].unsqueeze(0)
-        return x
-
-
-
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_h, d_ff, dropout):
+    def __init__(self, d_model, num_heads, d_h, d_ff, dropout, rope_layer):
         super().__init__()
-        self.self_attention = FusedQKVMultiHeadAttention(d_model, num_heads, d_h, dropout)
+        self.attention = FusedQKVMultiHeadAttention(d_model, num_heads, d_h, dropout, rope_layer)
         self.feedforward = PositionWiseFeedForward(d_model, d_ff, dropout)
         self.layer_norms = nn.ModuleList([LayerNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, attn_mask):
-
-        self_attn_out = self.self_attention(x, attn_mask)
-        x = self.layer_norms[0](x + self.dropout(self_attn_out))
+    def forward(self, x):
+        attn_out = self.attention(x)
+        x = self.layer_norms[0](x + self.dropout(attn_out))
         ff_out = self.feedforward(x)
         x = self.layer_norms[1](x + self.dropout(ff_out))
         return x
 
 
 class Decoder(nn.Module):
-    def __init__(self, d_model, num_heads, d_h, d_ff, num_dec_layers, dropout):
+    def __init__(self, d_model, num_heads, d_h, d_ff, num_dec_layers, dropout, max_length):
         super().__init__()
+        self.rope_layer = RotaryPositionalEncoding(d_h, max_length)
         self.layers = nn.ModuleList(
-            [DecoderLayer(d_model, num_heads, d_h, d_ff, dropout) for _ in range(num_dec_layers)]
+            [
+                DecoderLayer(d_model, num_heads, d_h, d_ff, dropout, self.rope_layer)
+                for _ in range(num_dec_layers)
+            ]
         )
 
-    def make_self_attn_mask(self, q_padding_mask, k_padding_mask):
-        padding_mask = q_padding_mask.unsqueeze(-1) & k_padding_mask.unsqueeze(-2)
-        causal_mask = torch.tril(
-            torch.ones(
-                q_padding_mask.shape[1], k_padding_mask.shape[1], device=q_padding_mask.device
-            ).bool()
-        ).unsqueeze(0)
-        self_attn_mask = causal_mask & padding_mask
-        return self_attn_mask
-
-    def make_cross_attn_mask(self, q_padding_mask, k_padding_mask):
-        cross_attn_mask = q_padding_mask.unsqueeze(-1) & k_padding_mask.unsqueeze(-2)
-        return cross_attn_mask
-
-    def forward(self, x, padding_mask):
-        # Make attention masks
-        self_attn_mask = self.make_self_attn_mask(padding_mask, padding_mask)
-
+    def forward(self, x):
         for layer in self.layers:
-            x = layer(x, self_attn_mask)
+            x = layer(x)
         return x
 
 
 class Output(nn.Module):
     def __init__(self, d_model, vocab_size):
         super().__init__()
-        self.linear = Linear(d_model, vocab_size)
+        self.linear = nn.Linear(d_model, vocab_size)
 
     def forward(self, tgt_dec):
         x = self.linear(tgt_dec)
@@ -231,21 +246,19 @@ class Transformer(nn.Module):
     ):
         super().__init__()
         self.embedding = Embedding(vocab_size, d_model)
-        self.positional_encoder = PositionalEncoding(d_model, max_length)
-        self.decoder = Decoder(d_model, num_heads, d_h, d_ff, num_layers, dropout)
+        self.decoder = Decoder(d_model, num_heads, d_h, d_ff, num_layers, dropout, max_length)
         self.output = Output(d_model, vocab_size)
         self.dropout = nn.Dropout(dropout)
 
-
-    def forward(self, x, padding_mask):
-        x_emb = self.dropout(self.positional_encoder(self.embedding(x)))
-        x_dec = self.decoder(x_emb, padding_mask)
+    def forward(self, x):
+        x_emb = self.dropout(self.embedding(x))
+        x_dec = self.decoder(x_emb)
         out = self.output(x_dec)
         return out
 
 
 def init_weights(m):
-    if isinstance(m, (nn.Linear, Linear)):
+    if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
