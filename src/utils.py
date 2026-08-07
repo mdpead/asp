@@ -11,15 +11,41 @@ def get_run_path(config):
     return f"{config['locations']['models_dir']}/{config['name']}"
 
 
-RESUMABLE_KEYS = {"train": {"num_steps", "checkpoint_steps", "validation_steps", "validation_batches", "minibatch_token_size", "cache_clear_steps", "num_workers"}}
+# Keys that can change without invalidating a checkpoint. Sections are keyed by
+# their top-level name, but the keys themselves live one level down under a stage
+# (train.pretrain.num_steps), so stripping has to descend into each stage.
+RESUMABLE_KEYS = {
+    "train": {
+        "num_steps",
+        "checkpoint_steps",
+        "validation_steps",
+        "validation_batches",
+        "minibatch_token_size",
+        "cache_clear_steps",
+        "num_workers",
+        "prefetch_factor",
+        "compile_model",
+    }
+}
+
+
+def _strip_resumable(config):
+    stripped = dict(config)
+    for section, keys in RESUMABLE_KEYS.items():
+        section_config = stripped.get(section)
+        if not isinstance(section_config, dict):
+            continue
+        stripped[section] = {
+            stage: {k: v for k, v in stage_config.items() if k not in keys}
+            if isinstance(stage_config, dict)
+            else stage_config
+            for stage, stage_config in section_config.items()
+        }
+    return stripped
 
 
 def _config_requires_restart(existing, current):
-    for section, keys in RESUMABLE_KEYS.items():
-        if section in existing and section in current:
-            existing = {**existing, section: {k: v for k, v in existing[section].items() if k not in keys}}
-            current = {**current, section: {k: v for k, v in current[section].items() if k not in keys}}
-    return existing != current
+    return _strip_resumable(existing) != _strip_resumable(current)
 
 
 def set_seed(seed):

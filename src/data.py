@@ -4,11 +4,19 @@ from torch.utils.data import Dataset
 
 
 def _load_starcoder(ds_config, seed):
-    ds = hf_datasets.load_dataset("bigcode/starcoderdata", data_dir="python", split="train", streaming=False)
+    # Stream when only a sample is wanted: the python subset is tens of GB, and a
+    # non-streaming load fetches all of it before select() trims it down.
+    sample_size = ds_config.get("sample_size")
+    if sample_size is not None:
+        stream = hf_datasets.load_dataset(
+            "bigcode/starcoderdata", data_dir="python", split="train", streaming=True
+        )
+        ds = hf_datasets.Dataset.from_list(list(itertools.islice(stream, sample_size)))
+    else:
+        ds = hf_datasets.load_dataset(
+            "bigcode/starcoderdata", data_dir="python", split="train", streaming=False
+        )
     num_rows = len(ds)
-    if "sample_size" in ds_config:
-        num_rows = min(ds_config["sample_size"], num_rows)
-        ds = ds.select(range(num_rows))
     test_size = int(num_rows * ds_config["test_split_ratio"])
     return {"test": ds.select(range(test_size)), "train": ds.select(range(test_size, num_rows))}
 

@@ -2,41 +2,44 @@ name: base
 seed: 0
 
 model:
-  d_model: 512
-  num_heads: 8
-  max_length: 256
-  d_ff: 2048
-  num_enc_layers: 6
-  num_dec_layers: 6
-  dropout: 0.1
+  d_model: 768
+  num_heads: 12
+  d_h: 64            # num_heads * d_h == d_model, so attention doesn't bottleneck
+  max_length: 512
+  d_ff: 3072         # 4 * d_model
+  num_layers: 12
+  dropout: 0.0       # single pass over a large corpus, so no regularisation needed
 
 train:
-  effective_batch_token_size: 25000
-  minibatch_token_size: 4096
-  learning_rate: 1.0e-3  # 1 / sqrt(d_model * warm_up_steps)
-  adam_betas: [0.9, 0.98]
-  adam_eps: 1.0e-9
-  num_steps: 50000
-  label_smoothing: 0.1
-  device: cuda
-  checkpoint_steps: 1000
-  warm_up_steps: 2000
-  validation_steps: 1000
-  validation_batches: 10
-  num_workers: 0
-  cache_clear_steps: 100
-  compile_model: false
+  pretrain:
+    effective_batch_token_size: 131072
+    minibatch_token_size: 4096     # -> batch of 8 at max_length 512; 32 accumulation steps
+    learning_rate: 8.0e-4  # 1 / sqrt(d_model * warm_up_steps)
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 20000               # ~2.6B tokens, roughly compute-optimal for 134M params
+    label_smoothing: 0.0
+    device: cuda
+    checkpoint_steps: 2000         # ~1.6GB per checkpoint and nothing prunes them
+    warm_up_steps: 2000
+    validation_steps: 500
+    validation_batches: 20
+    compile_model: true
+    num_workers: 4
+    prefetch_factor: 2
+    cache_clear_steps: 100
 
 data:
-  train:
-    ds: techiaith/cardiff-university-tm-en-cy
-    test_split_ratio: 0.1
+  pretrain:
+    name: starcoder
+    test_split_ratio: 0.001
+    # No sample_size: loads the full python subset (tens of GB, cached to disk).
+    # Add sample_size to switch to the streamed sample path used by configs/test.yaml.
 
 tokenizer:
-  vocab_size: 16000
-  pad_token_id: 2
-  training_size: null
+  vocab_size: 32000
+  training_size: 50000   # source files used to train BPE, not the training corpus size
 
 locations:
   data_dir: ./data
-  models_dir: ./runs
+  models_dir: ./models

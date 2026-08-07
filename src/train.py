@@ -58,10 +58,7 @@ def validation_step(
         }
 
         with torch.no_grad():
-            logits = model(
-                minibatch["input_ids"],
-                minibatch["padding_mask"],
-            )
+            logits = model(minibatch["input_ids"])
             loss = criterion(
                 logits.reshape(-1, logits.shape[2]), minibatch["output_ids"].reshape(-1)
             )
@@ -124,10 +121,7 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
         with amp.autocast(device_type=device.type):
 
             # Forward pass
-            logits = model(
-                batch["input_ids"],
-                batch["padding_mask"],
-            )
+            logits = model(batch["input_ids"])
             loss = criterion(
                 logits.reshape(-1, logits.shape[2]), batch["output_ids"].reshape(-1)
             )

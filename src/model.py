@@ -5,7 +5,7 @@ from src.kernels import flash_attention
 
 
 class PositionWiseFeedForward(nn.Module):
-    def __init__(self, d_model, d_ff, dropout):
+    def __init__(self, d_model, d_ff):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
@@ -19,7 +19,7 @@ class PositionWiseFeedForward(nn.Module):
 
 
 class MixtureOfExpertsFeedForward(nn.Module):
-    def __init__(self, d_model, d_ff, num_experts, dropout):
+    def __init__(self, d_model, d_ff, num_experts):
         super().__init__()
         self.num_experts = num_experts
         self.relu = nn.ReLU()
@@ -29,68 +29,28 @@ class MixtureOfExpertsFeedForward(nn.Module):
         return x
 
 
-class LayerNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-6):
         super().__init__()
-        self.eps = eps
         self.alpha = nn.Parameter(torch.ones(d_model))
-        self.bias = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
 
     def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True, unbiased=False)
-        return self.alpha * (x - mean) / (std + self.eps) + self.bias
+        x_prec = x.to(torch.float32)
+        ms = (x_prec**2).mean(-1, keepdim=True)
+        x_scaled = x_prec * torch.rsqrt(ms + self.eps)
+        out = x_scaled * self.alpha
+        out = out.to(x.dtype)
+        return out
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads, dropout):
-        super().__init__()
-        assert d_model % num_heads == 0
-        self.num_heads = num_heads
-        self.d_h = d_model // num_heads
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-        self.W_o = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, q, k, v, attn_mask):
-        # Create Q,K,V tensors
-        Q = self.W_q(q)
-        K = self.W_k(k)
-        V = self.W_v(v)
-
-        # Split into multi heads (batch_no, num_heads, seq_no, d_h)
-        Q_mh = Q.reshape(Q.shape[0], Q.shape[1], self.num_heads, self.d_h).permute(0, 2, 1, 3)
-        K_mh = K.reshape(K.shape[0], K.shape[1], self.num_heads, self.d_h).permute(0, 2, 1, 3)
-        V_mh = V.reshape(V.shape[0], V.shape[1], self.num_heads, self.d_h).permute(0, 2, 1, 3)
-
-        # Calculate attention matrices
-        attn_raw = torch.matmul(Q_mh, K_mh.transpose(-1, -2)) / math.sqrt(self.d_h)
-        attn_mask_mh = attn_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-        fill_value = torch.finfo(attn_raw.dtype).min  # works for fp16/bf16/fp32
-        attn_masked = attn_raw.masked_fill(~attn_mask_mh, fill_value)
-        attn = torch.softmax(attn_masked, -1)
-        attn = self.dropout(attn)
-
-        # Apply to value vectors and recombine
-        A_mh = torch.matmul(attn, V_mh)
-        A = A_mh.permute(0, 2, 1, 3).reshape(A_mh.shape[0], A_mh.shape[2], -1)
-
-        # Project out
-        O = self.W_o(A)
-
-        return O
-
-
-class FusedQKVMultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads, d_h, dropout, rope_layer):
+    def __init__(self, d_model, num_heads, d_h, rope_layer):
         super().__init__()
         self.num_heads = num_heads
         self.d_h = d_h
         self.W_qkv = nn.Linear(d_model, num_heads * 3 * d_h)
         self.W_o = nn.Linear(num_heads * d_h, d_model)
-        self.dropout = nn.Dropout(dropout)
         self.rope = rope_layer
 
     def forward(self, x):
@@ -192,16 +152,16 @@ class Embedding(nn.Module):
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_h, d_ff, dropout, rope_layer):
         super().__init__()
-        self.attention = FusedQKVMultiHeadAttention(d_model, num_heads, d_h, dropout, rope_layer)
-        self.feedforward = PositionWiseFeedForward(d_model, d_ff, dropout)
-        self.layer_norms = nn.ModuleList([LayerNorm(d_model) for _ in range(0, 2)])
+        self.attention = MultiHeadAttention(d_model, num_heads, d_h, rope_layer)
+        self.feedforward = PositionWiseFeedForward(d_model, d_ff)
+        self.layer_norms = nn.ModuleList([RMSNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        attn_out = self.attention(x)
-        x = self.layer_norms[0](x + self.dropout(attn_out))
-        ff_out = self.feedforward(x)
-        x = self.layer_norms[1](x + self.dropout(ff_out))
+        attn_out = self.dropout(self.attention(self.layer_norms[0](x)))
+        x = x + attn_out
+        ff_out = self.dropout(self.feedforward(self.layer_norms[1](x)))
+        x = x + ff_out
         return x
 
 
@@ -209,16 +169,18 @@ class Decoder(nn.Module):
     def __init__(self, d_model, num_heads, d_h, d_ff, num_dec_layers, dropout, max_length):
         super().__init__()
         self.rope_layer = RotaryPositionalEncoding(d_h, max_length)
-        self.layers = nn.ModuleList(
+        self.decoder_layers = nn.ModuleList(
             [
                 DecoderLayer(d_model, num_heads, d_h, d_ff, dropout, self.rope_layer)
                 for _ in range(num_dec_layers)
             ]
         )
+        self.final_norm = RMSNorm(d_model)
 
     def forward(self, x):
-        for layer in self.layers:
+        for layer in self.decoder_layers:
             x = layer(x)
+        x = self.final_norm(x)
         return x
 
 
