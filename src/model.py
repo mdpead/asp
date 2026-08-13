@@ -2,6 +2,7 @@ from torch import nn
 import torch
 import math
 from src.kernels import flash_attention
+from torch.nn import functional as F
 
 
 class PositionWiseFeedForward(nn.Module):
@@ -18,15 +19,50 @@ class PositionWiseFeedForward(nn.Module):
         return x
 
 
-class MixtureOfExpertsFeedForward(nn.Module):
-    def __init__(self, d_model, d_ff, num_experts):
+class SwiGLUFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
         super().__init__()
-        self.num_experts = num_experts
-        self.relu = nn.ReLU()
+        self.gate = nn.Linear(d_model, d_ff, bias=False)
+        self.up = nn.Linear(d_model, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d_model, bias=False)
 
     def forward(self, x):
-        # Placeholder implementation
-        return x
+        g = F.silu(self.gate(x))
+        u = self.up(x)
+        u_g = g * u
+        o = self.down(u_g)
+        return o
+
+
+class MixtureOfExpertsFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts, top_k):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = nn.Linear(d_model, num_experts)
+        self.experts = nn.ModuleList(
+            [SwiGLUFeedForward(d_model, d_ff) for _ in range(0, num_experts)]
+        )
+
+    def forward(self, x):
+
+        route_l, route_ind = torch.topk(self.router(x), self.top_k, dim=-1)
+        route_p = F.softmax(route_l, dim=-1)
+
+        out = torch.zeros_like(x)
+        for i in range(0, self.num_experts):
+            token_expert = route_ind == i  # (batch, seq, k)
+            token_probs = (token_expert * route_p).sum(dim=-1)  # (batch, seq)
+
+            token_mask = torch.any(token_expert, dim=-1)  # (batch, seq)
+
+            tokens = x[token_mask]  # (seq_n, d_model)
+            token_expert_probs = token_probs[token_mask].unsqueeze(-1)  # (n, 1)
+
+            x_ff_i = self.experts[i](tokens)  # (seq_n, d_model)
+            out[token_mask] += token_expert_probs * x_ff_i  # (batch, seq, d_model)
+
+        return out
 
 
 class RMSNorm(nn.Module):
@@ -153,7 +189,7 @@ class DecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_h, d_ff, dropout, rope_layer):
         super().__init__()
         self.attention = MultiHeadAttention(d_model, num_heads, d_h, rope_layer)
-        self.feedforward = PositionWiseFeedForward(d_model, d_ff)
+        self.feedforward = SwiGLUFeedForward(d_model, d_ff)
         self.layer_norms = nn.ModuleList([RMSNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
