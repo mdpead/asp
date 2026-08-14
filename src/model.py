@@ -8,8 +8,8 @@ from torch.nn import functional as F
 class PositionWiseFeedForward(nn.Module):
     def __init__(self, d_model, d_ff):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
+        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
+        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
         self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -39,15 +39,17 @@ class MixtureOfExpertsFeedForward(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.router = nn.Linear(d_model, num_experts)
+        self.router = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList(
             [SwiGLUFeedForward(d_model, d_ff) for _ in range(0, num_experts)]
         )
 
     def forward(self, x):
 
-        route_l, route_ind = torch.topk(self.router(x), self.top_k, dim=-1)
+        router_logits = self.router(x)
+        route_l, route_ind = torch.topk(router_logits, self.top_k, dim=-1)
         route_p = F.softmax(route_l, dim=-1)
+        full_p = F.softmax(router_logits, dim=-1, dtype=torch.float32)  # (batch, seq, e)
 
         out = torch.zeros_like(x)
         for i in range(0, self.num_experts):
@@ -62,7 +64,13 @@ class MixtureOfExpertsFeedForward(nn.Module):
             x_ff_i = self.experts[i](tokens)  # (seq_n, d_model)
             out[token_mask] += token_expert_probs * x_ff_i  # (batch, seq, d_model)
 
-        return out
+        route_oh = F.one_hot(route_ind, self.num_experts).float()  # (batch, seq, k, num_experts)
+        expert_fracs = route_oh.mean(dim=(0, 1, 2))  # (e), sums to 1 so balance reads 1.0
+        expert_probs = full_p.mean(dim=(0, 1))  # (e)
+
+        loss_aux = self.num_experts * (expert_fracs * expert_probs).sum()
+
+        return out, loss_aux
 
 
 class RMSNorm(nn.Module):
@@ -80,34 +88,46 @@ class RMSNorm(nn.Module):
         return out
 
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads, d_h, rope_layer):
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_heads, d_h, rope_layer):
         super().__init__()
+        assert num_heads % num_kv_heads == 0
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.d_h = d_h
-        self.W_qkv = nn.Linear(d_model, num_heads * 3 * d_h)
-        self.W_o = nn.Linear(num_heads * d_h, d_model)
+        self.qkv_proj = nn.Linear(d_model, (num_heads + 2 * num_kv_heads) * d_h, bias=False)
+        self.o_proj = nn.Linear(num_heads * d_h, d_model, bias=False)
+
         self.rope = rope_layer
 
     def forward(self, x):
 
         # Create Q, K, V tensors in a fused manner
-        QKV = (
-            self.W_qkv(x)
-            .reshape(x.shape[0], x.shape[1], self.num_heads, 3, self.d_h)
-            .permute(0, 2, 3, 1, 4)
-        )  # (batch, num_heads, 3, seq_len, d_h)
-        Q, K, V = QKV.unbind(dim=2)  # (batch, num_heads, seq_len, d_h)
+        qkv = self.qkv_proj(x)  # (batch, seq, (num_heads + 2 * num_kv_heads) * d_h)
+
+        qkv = qkv.reshape(
+            qkv.shape[0], qkv.shape[1], self.num_heads + 2 * self.num_kv_heads, self.d_h
+        )  # (batch, seq, num_heads + 2 * num_kv_heads, d_h)
+
+        q, k, v = torch.split(qkv, [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=2)
+
+        q = q.permute(0, 2, 1, 3)  # (batch, num_heads, seq_len, d_h)
+        k = k.permute(0, 2, 1, 3)  # (batch, num_kv_heads, seq_len, d_h)
+        v = v.permute(0, 2, 1, 3)  # (batch, num_kv_heads, seq_len, d_h)
 
         # Apply RoPE
-        Q, K = self.rope(Q, K)
+        q, k = self.rope(q, k)
+
+        # Fill out the kv heads so they match q, TODO: fix flash_attention to allow for gqa
+        k = torch.repeat_interleave(k, repeats=self.num_heads // self.num_kv_heads, dim=1)
+        v = torch.repeat_interleave(v, repeats=self.num_heads // self.num_kv_heads, dim=1)
 
         # Apply flash attention kernel
-        attn_mh = flash_attention(Q, K, V, causal=True)  # (batch, num_heads, seq_len, d_h)
+        attn_mh = flash_attention(q, k, v, causal=True)  # (batch, num_heads, seq_len, d_h)
 
         # Project out
         attn_flat = attn_mh.permute(0, 2, 1, 3).reshape(attn_mh.shape[0], attn_mh.shape[2], -1)
-        O = self.W_o(attn_flat)  # (batch, seq_len, d_model)
+        O = self.o_proj(attn_flat)  # (batch, seq_len, d_model)
 
         return O
 
@@ -186,48 +206,66 @@ class Embedding(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_h, d_ff, dropout, rope_layer):
+    def __init__(
+        self, d_model, num_heads, num_kv_heads, d_h, d_ff, num_experts, top_k, dropout, rope_layer
+    ):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, num_heads, d_h, rope_layer)
-        self.feedforward = SwiGLUFeedForward(d_model, d_ff)
+        self.attention = GroupedQueryAttention(d_model, num_heads, num_kv_heads, d_h, rope_layer)
+        self.feedforward = MixtureOfExpertsFeedForward(d_model, d_ff, num_experts, top_k)
         self.layer_norms = nn.ModuleList([RMSNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        attn_out = self.dropout(self.attention(self.layer_norms[0](x)))
-        x = x + attn_out
-        ff_out = self.dropout(self.feedforward(self.layer_norms[1](x)))
-        x = x + ff_out
-        return x
+        attn_out = self.attention(self.layer_norms[0](x))
+        x = x + self.dropout(attn_out)
+        ff_out, loss_aux = self.feedforward(self.layer_norms[1](x))
+        x = x + self.dropout(ff_out)
+        return x, loss_aux
 
 
 class Decoder(nn.Module):
-    def __init__(self, d_model, num_heads, d_h, d_ff, num_dec_layers, dropout, max_length):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        num_kv_heads,
+        d_h,
+        d_ff,
+        num_experts,
+        top_k,
+        num_dec_layers,
+        dropout,
+        max_length,
+    ):
         super().__init__()
         self.rope_layer = RotaryPositionalEncoding(d_h, max_length)
         self.decoder_layers = nn.ModuleList(
             [
-                DecoderLayer(d_model, num_heads, d_h, d_ff, dropout, self.rope_layer)
+                DecoderLayer(
+                    d_model,
+                    num_heads,
+                    num_kv_heads,
+                    d_h,
+                    d_ff,
+                    num_experts,
+                    top_k,
+                    dropout,
+                    self.rope_layer,
+                )
                 for _ in range(num_dec_layers)
             ]
         )
         self.final_norm = RMSNorm(d_model)
 
     def forward(self, x):
+        loss_aux_sum = 0
         for layer in self.decoder_layers:
-            x = layer(x)
+            x, loss_aux = layer(x)
+            loss_aux_sum += loss_aux
+
+        loss_aux = loss_aux_sum / len(self.decoder_layers)
         x = self.final_norm(x)
-        return x
-
-
-class Output(nn.Module):
-    def __init__(self, d_model, vocab_size):
-        super().__init__()
-        self.linear = nn.Linear(d_model, vocab_size)
-
-    def forward(self, tgt_dec):
-        x = self.linear(tgt_dec)
-        return x
+        return x, loss_aux
 
 
 class Transformer(nn.Module):
@@ -235,8 +273,11 @@ class Transformer(nn.Module):
         self,
         d_model,
         num_heads,
+        num_kv_heads,
         d_h,
         d_ff,
+        num_experts,
+        top_k,
         num_layers,
         vocab_size,
         max_length,
@@ -244,15 +285,25 @@ class Transformer(nn.Module):
     ):
         super().__init__()
         self.embedding = Embedding(vocab_size, d_model)
-        self.decoder = Decoder(d_model, num_heads, d_h, d_ff, num_layers, dropout, max_length)
-        self.output = Output(d_model, vocab_size)
+        self.decoder = Decoder(
+            d_model,
+            num_heads,
+            num_kv_heads,
+            d_h,
+            d_ff,
+            num_experts,
+            top_k,
+            num_layers,
+            dropout,
+            max_length,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         x_emb = self.dropout(self.embedding(x))
-        x_dec = self.decoder(x_emb)
-        out = self.output(x_dec)
-        return out
+        x_dec, loss_aux = self.decoder(x_emb)
+        out = torch.matmul(x_dec, self.embedding.E.T)
+        return out, loss_aux
 
 
 def init_weights(m):
@@ -271,8 +322,11 @@ def build_transformer(config):
     transformer = Transformer(
         model_config["d_model"],
         model_config["num_heads"],
+        model_config["num_kv_heads"],
         model_config["d_h"],
         model_config["d_ff"],
+        model_config["num_experts"],
+        model_config["top_k"],
         model_config["num_layers"],
         config["tokenizer"]["vocab_size"],
         model_config["max_length"],

@@ -4,9 +4,12 @@ seed: 0
 model:
   d_model: 768
   num_heads: 12
+  num_kv_heads: 4    # GQA: groups of 3 query heads share a K/V head
   d_h: 64            # num_heads * d_h == d_model, so attention doesn't bottleneck
   max_length: 512
-  d_ff: 3072         # 4 * d_model
+  d_ff: 1024         # hidden dim per expert
+  num_experts: 8     # total experts per MoE layer
+  top_k: 2           # experts active per token (Mixtral-style)
   num_layers: 12
   dropout: 0.0       # single pass over a large corpus, so no regularisation needed
 
@@ -19,6 +22,7 @@ train:
     adam_eps: 1.0e-8
     num_steps: 20000               # ~2.6B tokens, roughly compute-optimal for 134M params
     label_smoothing: 0.0
+    router_aux_loss_coef: 0.01     # weight on the MoE load-balancing loss (Switch Transformer default)
     device: cuda
     checkpoint_steps: 2000         # ~1.6GB per checkpoint and nothing prunes them
     warm_up_steps: 2000

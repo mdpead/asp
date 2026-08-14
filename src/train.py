@@ -5,8 +5,6 @@ import logging
 import time
 from torch.optim import Optimizer
 from torch import amp
-import sacrebleu
-from src import generation
 import os
 import itertools
 import json
@@ -37,7 +35,6 @@ class WarmupInverseSquareRootLR(LRScheduler):
         return lrs
 
 
-
 def validation_step(
     model, dataloader, criterion, device, tokenizer, step_no, max_length, validation_minibatches
 ):
@@ -45,10 +42,10 @@ def validation_step(
     model.eval()
     start_time = time.time()
 
-    total_loss = 0.0
+    total_loss_ce = 0.0
+    total_loss_aux = 0.0
     total_tokens = 0
     num_batches = 0
-    bleu_batch = None
 
     for minibatch in itertools.islice(dataloader, validation_minibatches):
 
@@ -58,16 +55,15 @@ def validation_step(
         }
 
         with torch.no_grad():
-            logits = model(minibatch["input_ids"])
+            logits, loss_aux = model(minibatch["input_ids"])
             loss = criterion(
                 logits.reshape(-1, logits.shape[2]), minibatch["output_ids"].reshape(-1)
             )
 
-        total_loss += loss.item()
+        total_loss_ce += loss.item()
+        total_loss_aux += loss_aux.item()
         total_tokens += minibatch["input_ids"].ne(tokenizer.pad_token_id).sum().item()
         num_batches += 1
-        if bleu_batch is None:
-            bleu_batch = minibatch
 
     elapsed_time = time.time() - start_time
 
@@ -76,7 +72,8 @@ def validation_step(
         "step_no": step_no,
         "num_tokens": total_tokens,
         "tokens_per_sec": total_tokens / elapsed_time,
-        "loss": total_loss / num_batches,
+        "loss_ce": total_loss_ce / num_batches,
+        "loss_aux": total_loss_aux / num_batches,
     }
 
 
@@ -84,13 +81,16 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
 
     train_config = config["train"][stage]
     device = torch.device(train_config["device"])
-    grad_accum_steps = train_config["effective_batch_token_size"] // train_config["minibatch_token_size"]
+    grad_accum_steps = (
+        train_config["effective_batch_token_size"] // train_config["minibatch_token_size"]
+    )
     num_steps = train_config["num_steps"]
     checkpoint_steps = train_config["checkpoint_steps"]
     validation_steps = train_config["validation_steps"]
     validation_batches = train_config["validation_batches"]
     max_length = config["model"]["max_length"]
     cache_clear_steps = train_config.get("cache_clear_steps")
+    router_aux_loss_coef = train_config["router_aux_loss_coef"]
 
     criterion = run["criterion"]
     optimiser = run["optimiser"]
@@ -103,7 +103,8 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
     # Initialise values - need to do learning rate, optimiser state, scaler state loading here too
     batch_tokens = 0
     start_time = time.time()
-    total_loss = 0.0
+    total_loss_ce = 0.0
+    total_loss_aux = 0.0
     # Resume exactly where we left off: skip the sampler forward in index space
     # (no batches are read from disk for skipped positions).
     batch_size = train_config["minibatch_token_size"] // max_length
@@ -115,16 +116,18 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
 
         # Move batch to device
         batch = {
-            k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
+            k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
         }
 
         with amp.autocast(device_type=device.type):
 
             # Forward pass
-            logits = model(batch["input_ids"])
-            loss = criterion(
+            logits, loss_aux = model(batch["input_ids"])
+            loss_ce = criterion(
                 logits.reshape(-1, logits.shape[2]), batch["output_ids"].reshape(-1)
             )
+            loss = loss_ce + loss_aux * router_aux_loss_coef
 
         # Compute loss and gradients
         minibatch_tokens = batch["input_ids"].ne(tokenizer.pad_token_id).sum().item()
@@ -132,7 +135,8 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
 
         scaled_loss = loss / grad_accum_steps
         scaler.scale(scaled_loss).backward()
-        total_loss += scaled_loss.item()
+        total_loss_ce += loss_ce.item() / grad_accum_steps
+        total_loss_aux += loss_aux.item() / grad_accum_steps
 
         # Gradient accumulation
         if (accum_idx + 1) % grad_accum_steps != 0:
@@ -157,7 +161,8 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
         result["num_tokens"] = batch_tokens
         result["tokens_per_sec"] = batch_tokens / elapsed_time
         result["learning_rate"] = lr_scheduler.get_last_lr()[0]
-        result["loss"] = total_loss
+        result["loss_ce"] = total_loss_ce
+        result["loss_aux"] = total_loss_aux
         result["token_length"] = batch["input_ids"].shape[1]
         result["grad_norm"] = grad_norm.item()
         results.append(result)
@@ -166,7 +171,8 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
         # Reset counters
         batch_tokens = 0
         start_time = time.time()
-        total_loss = 0.0
+        total_loss_ce = 0.0
+        total_loss_aux = 0.0
 
         # Validation step
         if step_no % validation_steps == 0:
@@ -189,7 +195,7 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
             save_checkpoint(model, optimiser, lr_scheduler, scaler, run_path, step_no, results)
 
         # Delete tensors to free up memory
-        del batch, logits, loss, scaled_loss
+        del batch, logits, loss, loss_ce, loss_aux, scaled_loss
         if cache_clear_steps and step_no % cache_clear_steps == 0:
             torch.cuda.empty_cache()
 
@@ -262,7 +268,9 @@ def create_run(model, train_config, tokenizer):
     device = torch.device(train_config["device"])
     model.to(device)
 
-    criterion, optimiser, lr_scheduler, scaler = create_training_objects(model, train_config, tokenizer)
+    criterion, optimiser, lr_scheduler, scaler = create_training_objects(
+        model, train_config, tokenizer
+    )
 
     return {
         "model": model,
@@ -287,7 +295,9 @@ def load_run(run_path, model, train_config, tokenizer):
 
     checkpoint = load_checkpoint(run_path, checkpoint_latest_step, device)
 
-    criterion, optimiser, lr_scheduler, scaler = create_training_objects(model, train_config, tokenizer)
+    criterion, optimiser, lr_scheduler, scaler = create_training_objects(
+        model, train_config, tokenizer
+    )
 
     model.load_state_dict(checkpoint["model_state_dict"])
     optimiser.load_state_dict(checkpoint["optimizer_state_dict"])

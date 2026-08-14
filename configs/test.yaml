@@ -2,35 +2,41 @@ name: test
 seed: 0
 
 model:
-  d_model: 1024
+  d_model: 256
   num_heads: 4
-  max_length: 64
+  num_kv_heads: 2    # GQA: groups of 2 query heads share a K/V head
   d_h: 64
+  max_length: 64
   d_ff: 1024
+  num_experts: 4     # total experts per MoE layer
+  top_k: 2           # experts active per token (Mixtral-style)
   num_layers: 2
-  dropout: 0.1
+  dropout: 0.0
 
 train:
   pretrain:
-    effective_batch_token_size: 20000
-    minibatch_token_size: 8192
-    learning_rate: 1.0e-4  # 1 / (D_MODEL * WARM_UP_STEPS) ** 0.5
-    adam_betas: [0.9, 0.98]
-    adam_eps: 1.0e-9
+    effective_batch_token_size: 16384
+    minibatch_token_size: 8192     # -> 2 accumulation steps
+    learning_rate: 1.0e-4
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
     num_steps: 200
-    label_smoothing: 0.1
+    label_smoothing: 0.0
+    router_aux_loss_coef: 0.01     # weight on the MoE load-balancing loss (Switch Transformer default)
     device: cuda
-    checkpoint_steps: 5
+    checkpoint_steps: 100
     warm_up_steps: 5
-    validation_steps: 5
+    validation_steps: 20
     validation_batches: 1
     compile_model: true
     num_workers: 4
+    prefetch_factor: 2
+    cache_clear_steps: 50
 
 data:
   pretrain:
     name: starcoder
-    sample_size: 1000
+    sample_size: 1000       # streamed sample path; base loads the full subset
     test_split_ratio: 0.1
 
 tokenizer:
