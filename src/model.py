@@ -3,6 +3,7 @@ import torch
 import math
 from src.kernels import flash_attention
 from torch.nn import functional as F
+from torch import Tensor
 
 
 class PositionWiseFeedForward(nn.Module):
@@ -100,7 +101,7 @@ class GroupedQueryAttention(nn.Module):
 
         self.rope = rope_layer
 
-    def forward(self, x):
+    def forward(self, x:Tensor, seq_starts: Tensor):
 
         # Create Q, K, V tensors in a fused manner
         qkv = self.qkv_proj(x)  # (batch, seq, (num_heads + 2 * num_kv_heads) * d_h)
@@ -118,12 +119,8 @@ class GroupedQueryAttention(nn.Module):
         # Apply RoPE
         q, k = self.rope(q, k)
 
-        # Fill out the kv heads so they match q, TODO: fix flash_attention to allow for gqa
-        k = torch.repeat_interleave(k, repeats=self.num_heads // self.num_kv_heads, dim=1)
-        v = torch.repeat_interleave(v, repeats=self.num_heads // self.num_kv_heads, dim=1)
-
-        # Apply flash attention kernel
-        attn_mh = flash_attention(q, k, v, causal=True)  # (batch, num_heads, seq_len, d_h)
+        # K and V stay at num_kv_heads; the kernel maps each query head to its group
+        attn_mh = flash_attention(q, k, v, seq_starts, causal=True)  # (batch, num_heads, seq, d_h)
 
         # Project out
         attn_flat = attn_mh.permute(0, 2, 1, 3).reshape(attn_mh.shape[0], attn_mh.shape[2], -1)
@@ -215,8 +212,8 @@ class DecoderLayer(nn.Module):
         self.layer_norms = nn.ModuleList([RMSNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        attn_out = self.attention(self.layer_norms[0](x))
+    def forward(self, x: Tensor, seq_starts: Tensor):
+        attn_out = self.attention(self.layer_norms[0](x), seq_starts)
         x = x + self.dropout(attn_out)
         ff_out, loss_aux = self.feedforward(self.layer_norms[1](x))
         x = x + self.dropout(ff_out)
@@ -257,10 +254,10 @@ class Decoder(nn.Module):
         )
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x: Tensor, seq_starts: Tensor):
         loss_aux_sum = 0
         for layer in self.decoder_layers:
-            x, loss_aux = layer(x)
+            x, loss_aux = layer(x, seq_starts)
             loss_aux_sum += loss_aux
 
         loss_aux = loss_aux_sum / len(self.decoder_layers)
@@ -284,6 +281,7 @@ class Transformer(nn.Module):
         dropout,
     ):
         super().__init__()
+        self.max_length = max_length  # context bound: RoPE table size and training seq length
         self.embedding = Embedding(vocab_size, d_model)
         self.decoder = Decoder(
             d_model,
@@ -299,9 +297,14 @@ class Transformer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x: Tensor, seq_starts: Tensor | None = None):
+        # Training right-pads, where causal masking already excludes pad keys, so no
+        # leading padding to skip. Left-padded generation passes real offsets.
+        if seq_starts is None:
+            seq_starts = torch.zeros(x.shape[0], dtype=torch.int32, device=x.device)
+
         x_emb = self.dropout(self.embedding(x))
-        x_dec, loss_aux = self.decoder(x_emb)
+        x_dec, loss_aux = self.decoder(x_emb, seq_starts)
         out = torch.matmul(x_dec, self.embedding.E.T)
         return out, loss_aux
 

@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
+from torch import Tensor
+
 
 @triton.autotune(
     configs=[
@@ -19,7 +21,7 @@ import triton.language as tl
             {"BLOCK_SIZE_Q_SEQ": 128, "BLOCK_SIZE_KV_SEQ": 128}, num_warps=8, num_stages=3
         ),
     ],
-    key=["BATCHES", "HEADS", "SEQS", "HEAD_DIMS", "causal"],
+    key=["BATCHES", "Q_HEADS", "KV_HEADS", "SEQS", "HEAD_DIMS", "causal"],
 )
 @triton.jit
 def flash_attention_forward_kernel(
@@ -28,9 +30,11 @@ def flash_attention_forward_kernel(
     v_ptr,
     o_ptr,
     l_ptr,
+    seq_starts_ptr,
     causal: tl.constexpr,
     BATCHES,
-    HEADS,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
     SEQS,
     HEAD_DIMS: tl.constexpr,
     stride_qb,
@@ -52,13 +56,19 @@ def flash_attention_forward_kernel(
     stride_lb,
     stride_lh,
     stride_ls,
+    stride_ss,
     BLOCK_SIZE_Q_SEQ: tl.constexpr,
     BLOCK_SIZE_KV_SEQ: tl.constexpr,
 ):
     # Calculate constant offsets and masks
-    pid_b = tl.program_id(axis=0) // HEADS
-    pid_h = tl.program_id(axis=0) % HEADS
-    pid_s = tl.program_id(axis=1)
+    pid_b = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=2)
+
+    # Load seq_starts
+    offset_ss = pid_b
+    seq_start_ptr = seq_starts_ptr + offset_ss * stride_ss
+    seq_start = tl.load(seq_start_ptr)
 
     # Load Q tile
     offsets_qb = pid_b
@@ -77,7 +87,7 @@ def flash_attention_forward_kernel(
     q_tile = tl.load(q_tile_ptrs, q_tile_mask, other=0.0)
 
     # Loop over KV tiles
-    s_max = tl.full((BLOCK_SIZE_Q_SEQ, 1), float("-inf"), dtype=tl.float32)
+    s_max = tl.full((BLOCK_SIZE_Q_SEQ, 1), -1e30, dtype=tl.float32)
     s_sum = tl.zeros((BLOCK_SIZE_Q_SEQ, 1), dtype=tl.float32)
     o_tile_weights = tl.zeros((BLOCK_SIZE_Q_SEQ, HEAD_DIMS), dtype=tl.float32)
     q_tile = q_tile * (1.0 / HEAD_DIMS**0.5)  # Scale q by the root dim once
@@ -91,43 +101,40 @@ def flash_attention_forward_kernel(
     else:
         kv_tiles = tl.cdiv(SEQS, BLOCK_SIZE_KV_SEQ)
     for tile_idx in range(0, kv_tiles):
-        # Load K tile
-        offsets_kb = pid_b
-        offsets_kh = pid_h
-        offsets_ks = tile_idx * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
-        offsets_kd = tl.arange(0, HEAD_DIMS)
+        # Calculate which KV tiles to load
+        offsets_kvb = pid_b
+        offsets_kvh = pid_h // (Q_HEADS // KV_HEADS)  # For GQA, ratio folds at compile time
+        offsets_kvs = tile_idx * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
+        offsets_kvd = tl.arange(0, HEAD_DIMS)
 
+        # Load K tile
         k_tile_ptrs = k_ptr + (
-            offsets_kb * stride_kb
-            + offsets_kh * stride_kh
-            + offsets_ks[:, None] * stride_ks
-            + offsets_kd[None, :] * stride_kd
+            offsets_kvb * stride_kb
+            + offsets_kvh * stride_kh
+            + offsets_kvs[:, None] * stride_ks
+            + offsets_kvd[None, :] * stride_kd
         )
-        k_tile_mask = (offsets_ks < SEQS)[:, None]
+        k_tile_mask = (offsets_kvs < SEQS)[:, None]
         k_tile = tl.load(k_tile_ptrs, k_tile_mask, other=0.0)
 
         # Load V tile
-        offsets_vb = pid_b
-        offsets_vh = pid_h
-        offsets_vs = tile_idx * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
-        offsets_vd = tl.arange(0, HEAD_DIMS)
-
         v_tile_ptrs = v_ptr + (
-            offsets_vb * stride_vb
-            + offsets_vh * stride_vh
-            + offsets_vs[:, None] * stride_vs
-            + offsets_vd[None, :] * stride_vd
+            offsets_kvb * stride_vb
+            + offsets_kvh * stride_vh
+            + offsets_kvs[:, None] * stride_vs
+            + offsets_kvd[None, :] * stride_vd
         )
-        v_tile_mask = (offsets_vs < SEQS)[:, None]
+        v_tile_mask = (offsets_kvs < SEQS)[:, None]
         v_tile = tl.load(v_tile_ptrs, v_tile_mask, other=0.0)
 
         # Compute scores for q,k,v tiles
         s_tile_raw = tl.dot(q_tile, k_tile.T)
+        padding_mask = offsets_kvs >= seq_start
         if causal:
-            causal_mask = offsets_ks[None, :] <= offsets_qs[:, None]
-            s_tile_raw = tl.where(causal_mask, s_tile_raw, float("-inf"))
+            causal_mask = offsets_kvs[None, :] <= offsets_qs[:, None]
+            s_tile_raw = tl.where(causal_mask & padding_mask[None, :], s_tile_raw, float("-inf"))
         else:
-            s_tile_raw = tl.where((offsets_ks < SEQS)[None, :], s_tile_raw, float("-inf"))
+            s_tile_raw = tl.where((offsets_kvs < SEQS)[None, :] & padding_mask[None, :], s_tile_raw, float("-inf"))
         s_tile_max = tl.max(s_tile_raw, axis=-1, keep_dims=True)
 
         # Scale old scores
@@ -146,6 +153,7 @@ def flash_attention_forward_kernel(
         o_tile_weights = o_tile_weights + o_tile_partial_weights
 
     # Apply final normalisation
+    s_sum = tl.where(s_sum == 0.0, 1.0, s_sum) # In case of rows with all -inf
     o_tile = (o_tile_weights / s_sum).to(o_ptr.dtype.element_ty)
 
     # Write out o_tile
@@ -180,30 +188,37 @@ def flash_attention_forward_kernel(
 
 
 def flash_attention_forward(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert q.is_cuda and k.is_cuda and v.is_cuda
+    q: Tensor, k: Tensor, v: Tensor, seq_starts: Tensor, causal: bool
+) -> tuple[Tensor, Tensor]:
+    assert q.is_cuda and k.is_cuda and v.is_cuda and seq_starts.is_cuda
 
-    BATCHES, HEADS, SEQS, HEAD_DIMS = q.shape
+    BATCHES, Q_HEADS, SEQS, HEAD_DIMS = q.shape
+    KV_HEADS = k.shape[1]
+    assert Q_HEADS % KV_HEADS == 0
+    assert seq_starts.shape == (BATCHES,)
+
     o = torch.empty_like(q)
-    l = torch.empty((BATCHES, HEADS, SEQS), dtype=torch.float32, device=q.device)
+    l = torch.empty((BATCHES, Q_HEADS, SEQS), dtype=torch.float32, device=q.device)
 
     stride_qb, stride_qh, stride_qs, stride_qd = q.stride()
     stride_kb, stride_kh, stride_ks, stride_kd = k.stride()
     stride_vb, stride_vh, stride_vs, stride_vd = v.stride()
     stride_ob, stride_oh, stride_os, stride_od = o.stride()
     stride_lb, stride_lh, stride_ls = l.stride()
+    stride_ss = seq_starts.stride(0)
 
-    grid = lambda meta: (BATCHES * HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
+    grid = lambda meta: (BATCHES, Q_HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
     flash_attention_forward_kernel[grid](
         q,
         k,
         v,
         o,
         l,
+        seq_starts,
         causal,
         BATCHES,
-        HEADS,
+        Q_HEADS,
+        KV_HEADS,
         SEQS,
         HEAD_DIMS,
         stride_qb,
@@ -225,6 +240,7 @@ def flash_attention_forward(
         stride_lb,
         stride_lh,
         stride_ls,
+        stride_ss,
     )
 
     return o, l
@@ -237,7 +253,7 @@ def flash_attention_forward(
         triton.Config({"BLOCK_SIZE_Q_SEQ": 128}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_SIZE_Q_SEQ": 256}, num_warps=8, num_stages=2),
     ],
-    key=["BATCHES", "HEADS", "SEQS", "HEAD_DIMS"],
+    key=["BATCHES", "Q_HEADS", "SEQS", "HEAD_DIMS"],
 )
 @triton.jit
 def flash_attention_backward_kernel_d(
@@ -245,7 +261,7 @@ def flash_attention_backward_kernel_d(
     do_ptr,
     d_ptr,
     BATCHES,
-    HEADS,
+    Q_HEADS,  # Unused in the body, kept so autotune re-tunes when the head count changes
     SEQS,
     HEAD_DIMS: tl.constexpr,
     stride_ob,
@@ -262,9 +278,9 @@ def flash_attention_backward_kernel_d(
     BLOCK_SIZE_Q_SEQ: tl.constexpr,
 ):
     # Calculate constant offsets and masks
-    pid_b = tl.program_id(axis=0) // HEADS
-    pid_h = tl.program_id(axis=0) % HEADS
-    pid_s = tl.program_id(axis=1)
+    pid_b = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=2)
 
     # Load O tile
     offsets_ob = pid_b
@@ -327,7 +343,7 @@ def flash_attention_backward_kernel_d(
             {"BLOCK_SIZE_Q_SEQ": 128, "BLOCK_SIZE_KV_SEQ": 128}, num_warps=8, num_stages=3
         ),
     ],
-    key=["BATCHES", "HEADS", "SEQS", "HEAD_DIMS", "causal"],
+    key=["BATCHES", "Q_HEADS", "KV_HEADS", "SEQS", "HEAD_DIMS", "causal"],
 )
 @triton.jit
 def flash_attention_backward_kernel_dq(
@@ -338,9 +354,11 @@ def flash_attention_backward_kernel_dq(
     do_ptr,
     dq_ptr,
     d_ptr,
+    seq_starts_ptr,
     causal: tl.constexpr,
     BATCHES,
-    HEADS,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
     SEQS,
     HEAD_DIMS: tl.constexpr,
     stride_qb,
@@ -369,13 +387,19 @@ def flash_attention_backward_kernel_dq(
     stride_db,
     stride_dh,
     stride_ds,
+    stride_ss,
     BLOCK_SIZE_Q_SEQ: tl.constexpr,
     BLOCK_SIZE_KV_SEQ: tl.constexpr,
 ):
     # Calculate constant offsets and masks
-    pid_b = tl.program_id(axis=0) // HEADS
-    pid_h = tl.program_id(axis=0) % HEADS
-    pid_s = tl.program_id(axis=1)
+    pid_b = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=2)
+
+    # Load seq_starts
+    offset_ss = pid_b
+    seq_start_ptr = seq_starts_ptr + offset_ss * stride_ss
+    seq_start = tl.load(seq_start_ptr)
 
     # Load Q tile
     offsets_qb = pid_b
@@ -416,7 +440,7 @@ def flash_attention_backward_kernel_dq(
         + offsets_dos[:, None] * stride_dos
         + offsets_dod[None, :] * stride_dod
     )
-    do_tile_mask = (offsets_ls < SEQS)[:, None]
+    do_tile_mask = (offsets_dos < SEQS)[:, None]
     do_tile = tl.load(do_tile_ptrs, do_tile_mask, other=0.0)
 
     # Load d tile
@@ -444,45 +468,42 @@ def flash_attention_backward_kernel_dq(
     else:
         kv_tiles = tl.cdiv(SEQS, BLOCK_SIZE_KV_SEQ)
     for tile_idx in range(0, kv_tiles):
-        # Load K tile
-        offsets_kb = pid_b
-        offsets_kh = pid_h
-        offsets_ks = tile_idx * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
-        offsets_kd = tl.arange(0, HEAD_DIMS)
+        # Calculate which KV tiles to load
+        offsets_kvb = pid_b
+        offsets_kvh = pid_h // (Q_HEADS // KV_HEADS)  # For GQA, ratio folds at compile time
+        offsets_kvs = tile_idx * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
+        offsets_kvd = tl.arange(0, HEAD_DIMS)
 
+        # Load K tile
         k_tile_ptrs = k_ptr + (
-            offsets_kb * stride_kb
-            + offsets_kh * stride_kh
-            + offsets_ks[:, None] * stride_ks
-            + offsets_kd[None, :] * stride_kd
+            offsets_kvb * stride_kb
+            + offsets_kvh * stride_kh
+            + offsets_kvs[:, None] * stride_ks
+            + offsets_kvd[None, :] * stride_kd
         )
-        k_tile_mask_s = offsets_ks < SEQS
-        k_tile_mask = k_tile_mask_s[:, None]
+        k_tile_mask = (offsets_kvs < SEQS)[:, None]
         k_tile = tl.load(k_tile_ptrs, k_tile_mask, other=0.0)
 
         # Load V tile
-        offsets_vb = pid_b
-        offsets_vh = pid_h
-        offsets_vs = tile_idx * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
-        offsets_vd = tl.arange(0, HEAD_DIMS)
-
         v_tile_ptrs = v_ptr + (
-            offsets_vb * stride_vb
-            + offsets_vh * stride_vh
-            + offsets_vs[:, None] * stride_vs
-            + offsets_vd[None, :] * stride_vd
+            offsets_kvb * stride_vb
+            + offsets_kvh * stride_vh
+            + offsets_kvs[:, None] * stride_vs
+            + offsets_kvd[None, :] * stride_vd
         )
-        v_tile_mask_s = offsets_vs < SEQS
-        v_tile_mask = v_tile_mask_s[:, None]
+        v_tile_mask = (offsets_kvs < SEQS)[:, None]
         v_tile = tl.load(v_tile_ptrs, v_tile_mask, other=0.0)
 
         # Compute scores for q,k,v tiles
         s_tile_raw = tl.dot(q_tile, k_tile.T)
+        padding_mask = offsets_kvs >= seq_start
         if causal:
-            causal_mask = offsets_ks[None, :] <= offsets_qs[:, None]
-            s_tile_raw = tl.where(causal_mask, s_tile_raw, float("-inf"))
+            causal_mask = offsets_kvs[None, :] <= offsets_qs[:, None]
+            s_tile_raw = tl.where(causal_mask & padding_mask[None, :], s_tile_raw, float("-inf"))
         else:
-            s_tile_raw = tl.where((offsets_ks < SEQS)[None, :], s_tile_raw, float("-inf"))
+            s_tile_raw = tl.where(
+                (offsets_kvs < SEQS)[None, :] & padding_mask[None, :], s_tile_raw, float("-inf")
+            )
 
         # Compute through to dq_tile
         p_tile = tl.exp(s_tile_raw - l_tile)  # Use l_tile to get p directly
@@ -525,7 +546,7 @@ def flash_attention_backward_kernel_dq(
             {"BLOCK_SIZE_Q_SEQ": 128, "BLOCK_SIZE_KV_SEQ": 128}, num_warps=8, num_stages=3
         ),
     ],
-    key=["BATCHES", "HEADS", "SEQS", "HEAD_DIMS", "causal"],
+    key=["BATCHES", "Q_HEADS", "KV_HEADS", "SEQS", "HEAD_DIMS", "causal"],
 )
 @triton.jit
 def flash_attention_backward_kernel_dkdv(
@@ -537,9 +558,11 @@ def flash_attention_backward_kernel_dkdv(
     dk_ptr,
     dv_ptr,
     d_ptr,
+    seq_starts_ptr,
     causal: tl.constexpr,
     BATCHES,
-    HEADS,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
     SEQS,
     HEAD_DIMS: tl.constexpr,
     stride_qb,
@@ -572,50 +595,46 @@ def flash_attention_backward_kernel_dkdv(
     stride_db,
     stride_dh,
     stride_ds,
+    stride_ss,
     BLOCK_SIZE_Q_SEQ: tl.constexpr,
     BLOCK_SIZE_KV_SEQ: tl.constexpr,
 ):
 
     # Calculate constant offsets and masks
-    pid_b = tl.program_id(axis=0) // HEADS
-    pid_h = tl.program_id(axis=0) % HEADS
-    pid_s = tl.program_id(axis=1)
+    pid_b = tl.program_id(axis=0)
+    pid_h = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=2)
+
+    # Load seq_starts
+    offset_ss = pid_b
+    seq_start_ptr = seq_starts_ptr + offset_ss * stride_ss
+    seq_start = tl.load(seq_start_ptr)
+
+    # Calculate which KV tiles to load
+    offsets_kvb = pid_b
+    offsets_kvh = pid_h
+    offsets_kvs = pid_s * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
+    offsets_kvd = tl.arange(0, HEAD_DIMS)
 
     # Load K tile
-    offsets_kb = pid_b
-    offsets_kh = pid_h
-    offsets_ks = pid_s * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
-    offsets_kd = tl.arange(0, HEAD_DIMS)
-
     k_tile_ptrs = k_ptr + (
-        offsets_kb * stride_kb
-        + offsets_kh * stride_kh
-        + offsets_ks[:, None] * stride_ks
-        + offsets_kd[None, :] * stride_kd
+        offsets_kvb * stride_kb
+        + offsets_kvh * stride_kh
+        + offsets_kvs[:, None] * stride_ks
+        + offsets_kvd[None, :] * stride_kd
     )
-    k_tile_mask_s = offsets_ks < SEQS
-    k_tile_mask = k_tile_mask_s[:, None]
+    k_tile_mask = (offsets_kvs < SEQS)[:, None]
     k_tile = tl.load(k_tile_ptrs, k_tile_mask, other=0.0)
 
     # Load V tile
-    offsets_vb = pid_b
-    offsets_vh = pid_h
-    offsets_vs = pid_s * BLOCK_SIZE_KV_SEQ + tl.arange(0, BLOCK_SIZE_KV_SEQ)
-    offsets_vd = tl.arange(0, HEAD_DIMS)
-
     v_tile_ptrs = v_ptr + (
-        offsets_vb * stride_vb
-        + offsets_vh * stride_vh
-        + offsets_vs[:, None] * stride_vs
-        + offsets_vd[None, :] * stride_vd
+        offsets_kvb * stride_vb
+        + offsets_kvh * stride_vh
+        + offsets_kvs[:, None] * stride_vs
+        + offsets_kvd[None, :] * stride_vd
     )
-    v_tile_mask_s = offsets_vs < SEQS
-    v_tile_mask = v_tile_mask_s[:, None]
+    v_tile_mask = (offsets_kvs < SEQS)[:, None]
     v_tile = tl.load(v_tile_ptrs, v_tile_mask, other=0.0)
-
-    # Loop over Q tiles
-    dk_tile = tl.zeros((BLOCK_SIZE_KV_SEQ, HEAD_DIMS), dtype=tl.float32)
-    dv_tile = tl.zeros((BLOCK_SIZE_KV_SEQ, HEAD_DIMS), dtype=tl.float32)
 
     # Figure out how many q tiles are needed depending on whether it's causal
     if causal:
@@ -624,80 +643,93 @@ def flash_attention_backward_kernel_dkdv(
         q_tile_start_idx = 0
     q_tile_end_idx = tl.cdiv(SEQS, BLOCK_SIZE_Q_SEQ)
 
-    for tile_idx in range(
-        q_tile_start_idx,
-        q_tile_end_idx,
-    ):
-        # Load Q tile
-        offsets_qb = pid_b
-        offsets_qh = pid_h
-        offsets_qs = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
-        offsets_qd = tl.arange(0, HEAD_DIMS)
 
-        q_tile_ptrs = q_ptr + (
-            offsets_qb * stride_qb
-            + offsets_qh * stride_qh
-            + offsets_qs[:, None] * stride_qs
-            + offsets_qd[None, :] * stride_qd
-        )
-        q_tile_mask = (offsets_qs < SEQS)[:, None]
-        q_tile = tl.load(q_tile_ptrs, q_tile_mask, other=0.0)
+    dk_tile = tl.zeros((BLOCK_SIZE_KV_SEQ, HEAD_DIMS), dtype=tl.float32)
+    dv_tile = tl.zeros((BLOCK_SIZE_KV_SEQ, HEAD_DIMS), dtype=tl.float32)
 
-        # Load L tile
-        offsets_lb = pid_b
-        offsets_lh = pid_h
-        offsets_ls = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
+    # Loop over Q heads for GQA
+    for q_head_idx in range(Q_HEADS // KV_HEADS):
 
-        l_tile_ptrs = l_ptr + (
-            offsets_lb * stride_lb + offsets_lh * stride_lh + offsets_ls[:, None] * stride_ls
-        )
-        l_tile_mask = (offsets_ls < SEQS)[:, None]
-        l_tile = tl.load(l_tile_ptrs, l_tile_mask, other=0.0)
+        # Loop over Q tiles
+        for tile_idx in range(
+            q_tile_start_idx,
+            q_tile_end_idx,
+        ):
+            # Load Q tile
+            offsets_qb = pid_b
+            offsets_qh = pid_h * (Q_HEADS // KV_HEADS) + q_head_idx
+            offsets_qs = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
+            offsets_qd = tl.arange(0, HEAD_DIMS)
 
-        # Load dO tile
-        offsets_dob = pid_b
-        offsets_doh = pid_h
-        offsets_dos = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
-        offsets_dod = tl.arange(0, HEAD_DIMS)
+            q_tile_ptrs = q_ptr + (
+                offsets_qb * stride_qb
+                + offsets_qh * stride_qh
+                + offsets_qs[:, None] * stride_qs
+                + offsets_qd[None, :] * stride_qd
+            )
+            q_tile_mask = (offsets_qs < SEQS)[:, None]
+            q_tile = tl.load(q_tile_ptrs, q_tile_mask, other=0.0)
 
-        do_tile_ptrs = do_ptr + (
-            offsets_dob * stride_dob
-            + offsets_doh * stride_doh
-            + offsets_dos[:, None] * stride_dos
-            + offsets_dod[None, :] * stride_dod
-        )
-        do_tile_mask = (offsets_ls < SEQS)[:, None]
-        do_tile = tl.load(do_tile_ptrs, do_tile_mask, other=0.0)
+            # Load L tile
+            offsets_lb = pid_b
+            offsets_lh = pid_h * (Q_HEADS // KV_HEADS) + q_head_idx
+            offsets_ls = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
 
-        # Load d tile
-        offsets_db = pid_b
-        offsets_dh = pid_h
-        offsets_ds = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
+            l_tile_ptrs = l_ptr + (
+                offsets_lb * stride_lb + offsets_lh * stride_lh + offsets_ls[:, None] * stride_ls
+            )
+            l_tile_mask = (offsets_ls < SEQS)[:, None]
+            l_tile = tl.load(l_tile_ptrs, l_tile_mask, other=0.0)
 
-        d_tile_ptrs = d_ptr + (
-            offsets_db * stride_db + offsets_dh * stride_dh + offsets_ds[:, None] * stride_ds
-        )
-        d_tile_mask = (offsets_ds < SEQS)[:, None]
-        d_tile = tl.load(d_tile_ptrs, d_tile_mask, other=0.0)
+            # Load dO tile
+            offsets_dob = pid_b
+            offsets_doh = pid_h * (Q_HEADS // KV_HEADS) + q_head_idx
+            offsets_dos = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
+            offsets_dod = tl.arange(0, HEAD_DIMS)
 
-        # Compute scores for q,k,v tiles
-        s_tile_raw = (1.0 / HEAD_DIMS**0.5) * tl.dot(q_tile, k_tile.T)
-        if causal:
-            causal_mask = offsets_ks[None, :] <= offsets_qs[:, None]
-            s_tile_raw = tl.where(causal_mask, s_tile_raw, float("-inf"))
-        else:
-            s_tile_raw = tl.where((offsets_ks < SEQS)[None, :], s_tile_raw, float("-inf"))
+            do_tile_ptrs = do_ptr + (
+                offsets_dob * stride_dob
+                + offsets_doh * stride_doh
+                + offsets_dos[:, None] * stride_dos
+                + offsets_dod[None, :] * stride_dod
+            )
+            do_tile_mask = (offsets_dos < SEQS)[:, None]
+            do_tile = tl.load(do_tile_ptrs, do_tile_mask, other=0.0)
 
-        # Compute through to dk/dv tiles
-        p_tile = tl.exp(s_tile_raw - l_tile)  # Use l_tile to get p directly
-        dp_tile = tl.dot(do_tile, v_tile.T)
-        ds_tile = p_tile * (dp_tile - d_tile)
-        dk_tile_partial = (1.0 / HEAD_DIMS**0.5) * tl.dot(ds_tile.T.to(q_tile.dtype), q_tile)
-        dv_tile_partial = tl.dot(p_tile.T.to(do_tile.dtype), do_tile)  # dV = P^T dO, no tau
+            # Load d tile
+            offsets_db = pid_b
+            offsets_dh = pid_h * (Q_HEADS // KV_HEADS) + q_head_idx
+            offsets_ds = tile_idx * BLOCK_SIZE_Q_SEQ + tl.arange(0, BLOCK_SIZE_Q_SEQ)
 
-        # Accumulate
-        dk_tile = dk_tile + dk_tile_partial
-        dv_tile = dv_tile + dv_tile_partial
+            d_tile_ptrs = d_ptr + (
+                offsets_db * stride_db + offsets_dh * stride_dh + offsets_ds[:, None] * stride_ds
+            )
+            d_tile_mask = (offsets_ds < SEQS)[:, None]
+            d_tile = tl.load(d_tile_ptrs, d_tile_mask, other=0.0)
+
+            # Compute scores for q,k,v tiles
+            s_tile_raw = (1.0 / HEAD_DIMS**0.5) * tl.dot(q_tile, k_tile.T)
+            padding_mask = offsets_kvs >= seq_start
+            if causal:
+                causal_mask = offsets_kvs[None, :] <= offsets_qs[:, None]
+                s_tile_raw = tl.where(
+                    causal_mask & padding_mask[None, :], s_tile_raw, float("-inf")
+                )
+            else:
+                s_tile_raw = tl.where(
+                    (offsets_kvs < SEQS)[None, :] & padding_mask[None, :], s_tile_raw, float("-inf")
+                )
+
+            # Compute through to dk/dv tiles
+            p_tile = tl.exp(s_tile_raw - l_tile)  # Use l_tile to get p directly
+            dp_tile = tl.dot(do_tile, v_tile.T)
+            ds_tile = p_tile * (dp_tile - d_tile)
+            dk_tile_partial = (1.0 / HEAD_DIMS**0.5) * tl.dot(ds_tile.T.to(q_tile.dtype), q_tile)
+            dv_tile_partial = tl.dot(p_tile.T.to(do_tile.dtype), do_tile)  # dV = P^T dO, no tau
+
+            # Accumulate
+            dk_tile = dk_tile + dk_tile_partial
+            dv_tile = dv_tile + dv_tile_partial
 
     # Store dk tile
     offsets_dkb = pid_b
@@ -739,15 +771,18 @@ def flash_attention_backward(
     o: torch.Tensor,
     l: torch.Tensor,
     do: torch.Tensor,
+    seq_starts: torch.Tensor,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.is_cuda and k.is_cuda and v.is_cuda and seq_starts.is_cuda
 
-    BATCHES, HEADS, SEQS, HEAD_DIMS = q.shape
+    BATCHES, Q_HEADS, SEQS, HEAD_DIMS = q.shape
+    KV_HEADS = k.shape[1]
+    assert seq_starts.shape == (BATCHES,)
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    d = torch.empty((BATCHES, HEADS, SEQS), dtype=torch.float32, device=dq.device)
+    d = torch.empty((BATCHES, Q_HEADS, SEQS), dtype=torch.float32, device=dq.device)
 
     stride_qb, stride_qh, stride_qs, stride_qd = q.stride()
     stride_kb, stride_kh, stride_ks, stride_kd = k.stride()
@@ -759,15 +794,16 @@ def flash_attention_backward(
     stride_dkb, stride_dkh, stride_dks, stride_dkd = dk.stride()
     stride_dvb, stride_dvh, stride_dvs, stride_dvd = dv.stride()
     stride_db, stride_dh, stride_ds = d.stride()
+    stride_ss = seq_starts.stride(0)
 
     # Preprocess d
-    grid_d = lambda meta: (BATCHES * HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
+    grid_d = lambda meta: (BATCHES, Q_HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
     flash_attention_backward_kernel_d[grid_d](
         o,
         do,
         d,
         BATCHES,
-        HEADS,
+        Q_HEADS,
         SEQS,
         HEAD_DIMS,
         stride_ob,
@@ -784,7 +820,7 @@ def flash_attention_backward(
     )
 
     # Calculate dq, parallelising over seqs
-    grid_dq = lambda meta: (BATCHES * HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
+    grid_dq = lambda meta: (BATCHES, Q_HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
     flash_attention_backward_kernel_dq[grid_dq](
         q,
         k,
@@ -793,9 +829,11 @@ def flash_attention_backward(
         do,
         dq,
         d,
+        seq_starts,
         causal,
         BATCHES,
-        HEADS,
+        Q_HEADS,
+        KV_HEADS,
         SEQS,
         HEAD_DIMS,
         stride_qb,
@@ -824,10 +862,11 @@ def flash_attention_backward(
         stride_db,
         stride_dh,
         stride_ds,
+        stride_ss,
     )
 
     # Calculate dk, dv parallelising over kv seq tiles
-    grid_dkdv = lambda meta: (BATCHES * HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_KV_SEQ"]))
+    grid_dkdv = lambda meta: (BATCHES, KV_HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_KV_SEQ"]))
     flash_attention_backward_kernel_dkdv[grid_dkdv](
         q,
         k,
@@ -837,9 +876,11 @@ def flash_attention_backward(
         dk,
         dv,
         d,
+        seq_starts,
         causal,
         BATCHES,
-        HEADS,
+        Q_HEADS,
+        KV_HEADS,
         SEQS,
         HEAD_DIMS,
         stride_qb,
@@ -872,6 +913,7 @@ def flash_attention_backward(
         stride_db,
         stride_dh,
         stride_ds,
+        stride_ss,
     )
 
     return dq, dk, dv
@@ -879,20 +921,20 @@ def flash_attention_backward(
 
 class FlashAttentionFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal):
-        o, l = flash_attention_forward(q, k, v, causal)
-        ctx.save_for_backward(q, k, v, o, l)
+    def forward(ctx, q: Tensor, k: Tensor, v: Tensor, seq_starts: Tensor, causal: bool):
+        o, l = flash_attention_forward(q, k, v, seq_starts, causal)
+        ctx.save_for_backward(q, k, v, o, l, seq_starts)
         ctx.causal = causal
         return o
 
     @staticmethod
     def backward(ctx, *grad_outputs):
         (do,) = grad_outputs
-        q, k, v, o, l = ctx.saved_tensors
+        q, k, v, o, l, seq_starts = ctx.saved_tensors
         causal = ctx.causal
-        dq, dk, dv = flash_attention_backward(q, k, v, o, l, do, causal)
-        return dq, dk, dv, None
+        dq, dk, dv = flash_attention_backward(q, k, v, o, l, do, seq_starts, causal)
+        return dq, dk, dv, None, None
 
 
-def flash_attention(q, k, v, causal=False):
-    return FlashAttentionFunction.apply(q, k, v, causal)
+def flash_attention(q: Tensor, k: Tensor, v: Tensor, seq_starts: Tensor, causal: bool=False):
+    return FlashAttentionFunction.apply(q, k, v, seq_starts, causal)
