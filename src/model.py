@@ -101,7 +101,7 @@ class GroupedQueryAttention(nn.Module):
 
         self.rope = rope_layer
 
-    def forward(self, x:Tensor, seq_starts: Tensor):
+    def forward(self, x: Tensor, seq_starts: Tensor, kv_cache: Tensor | None = None):
 
         # Create Q, K, V tensors in a fused manner
         qkv = self.qkv_proj(x)  # (batch, seq, (num_heads + 2 * num_kv_heads) * d_h)
@@ -110,14 +110,28 @@ class GroupedQueryAttention(nn.Module):
             qkv.shape[0], qkv.shape[1], self.num_heads + 2 * self.num_kv_heads, self.d_h
         )  # (batch, seq, num_heads + 2 * num_kv_heads, d_h)
 
-        q, k, v = torch.split(qkv, [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=2)
+        q, k_new, v_new = torch.split(
+            qkv, [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=2
+        )
 
         q = q.permute(0, 2, 1, 3)  # (batch, num_heads, seq_len, d_h)
-        k = k.permute(0, 2, 1, 3)  # (batch, num_kv_heads, seq_len, d_h)
-        v = v.permute(0, 2, 1, 3)  # (batch, num_kv_heads, seq_len, d_h)
+        k_new = k_new.permute(0, 2, 1, 3)  # (batch, num_kv_heads, seq_len, d_h)
+        v_new = v_new.permute(0, 2, 1, 3)  # (batch, num_kv_heads, seq_len, d_h)
 
         # Apply RoPE
-        q, k = self.rope(q, k)
+        if kv_cache is not None:
+            offset = kv_cache.shape[-2]
+        else:
+            offset = 0
+        q, k_new = self.rope(q, k_new, offset)
+
+        # Append onto the kv cache if using
+        if kv_cache is not None:
+            k = torch.concat((kv_cache[0], k_new), dim=2)
+            v = torch.concat((kv_cache[1], v_new), dim=2)
+        else:
+            k = k_new
+            v = v_new
 
         # K and V stay at num_kv_heads; the kernel maps each query head to its group
         attn_mh = flash_attention(q, k, v, seq_starts, causal=True)  # (batch, num_heads, seq, d_h)
@@ -126,7 +140,10 @@ class GroupedQueryAttention(nn.Module):
         attn_flat = attn_mh.permute(0, 2, 1, 3).reshape(attn_mh.shape[0], attn_mh.shape[2], -1)
         O = self.o_proj(attn_flat)  # (batch, seq_len, d_model)
 
-        return O
+        # Wrap up the new kv cache entries; training has no cache to append them to
+        kv_new = None if kv_cache is None else torch.stack((k_new, v_new), dim=0)
+
+        return O, kv_new
 
 
 class RotaryPositionalEncoding(nn.Module):
@@ -173,17 +190,18 @@ class RotaryPositionalEncoding(nn.Module):
 
         return out
 
-    def forward(self, Q, K):
+    def forward(self, Q, K, offset):
 
         seq_length = Q.shape[-2]
 
-        if seq_length > self.cos_thetas.shape[0]:
+        if offset + seq_length > self.cos_thetas.shape[0]:
             raise ValueError(
-                f"seq_length {seq_length} exceeds max_length {self.cos_thetas.shape[0]}"
+                f"offset {offset} + seq_length {seq_length} exceeds "
+                f"max_length {self.cos_thetas.shape[0]}"
             )
 
-        cos_thetas = self.cos_thetas[0:seq_length]
-        sin_thetas = self.sin_thetas[0:seq_length]
+        cos_thetas = self.cos_thetas[offset : offset + seq_length]
+        sin_thetas = self.sin_thetas[offset : offset + seq_length]
 
         Q_rot = self.rotate(Q, cos_thetas, sin_thetas)
         K_rot = self.rotate(K, cos_thetas, sin_thetas)
@@ -212,12 +230,12 @@ class DecoderLayer(nn.Module):
         self.layer_norms = nn.ModuleList([RMSNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, seq_starts: Tensor):
-        attn_out = self.attention(self.layer_norms[0](x), seq_starts)
+    def forward(self, x: Tensor, seq_starts: Tensor, kv_cache: Tensor | None = None):
+        attn_out, new_kv = self.attention(self.layer_norms[0](x), seq_starts, kv_cache)
         x = x + self.dropout(attn_out)
         ff_out, loss_aux = self.feedforward(self.layer_norms[1](x))
         x = x + self.dropout(ff_out)
-        return x, loss_aux
+        return x, loss_aux, new_kv
 
 
 class Decoder(nn.Module):
@@ -254,15 +272,19 @@ class Decoder(nn.Module):
         )
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x: Tensor, seq_starts: Tensor):
+    def forward(self, x: Tensor, seq_starts: Tensor, kv_cache: Tensor | None = None):
         loss_aux_sum = 0
-        for layer in self.decoder_layers:
-            x, loss_aux = layer(x, seq_starts)
+        new_kvs = []
+        for i, layer in enumerate(self.decoder_layers):
+            layer_cache = None if kv_cache is None else kv_cache[i]
+            x, loss_aux, new_kv = layer(x, seq_starts, layer_cache)
             loss_aux_sum += loss_aux
+            new_kvs.append(new_kv)
 
         loss_aux = loss_aux_sum / len(self.decoder_layers)
         x = self.final_norm(x)
-        return x, loss_aux
+        new_kv = None if kv_cache is None else torch.stack(new_kvs)  # (layers, 2, b, kv_h, q, d_h)
+        return x, loss_aux, new_kv
 
 
 class Transformer(nn.Module):
@@ -282,6 +304,9 @@ class Transformer(nn.Module):
     ):
         super().__init__()
         self.max_length = max_length  # context bound: RoPE table size and training seq length
+        self.num_kv_heads = num_kv_heads
+        self.d_h = d_h
+        self.num_layers = num_layers
         self.embedding = Embedding(vocab_size, d_model)
         self.decoder = Decoder(
             d_model,
@@ -297,16 +322,19 @@ class Transformer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, seq_starts: Tensor | None = None):
+    def forward(self, x: Tensor, seq_starts: Tensor | None = None, kv_cache: Tensor | None = None):
         # Training right-pads, where causal masking already excludes pad keys, so no
         # leading padding to skip. Left-padded generation passes real offsets.
         if seq_starts is None:
             seq_starts = torch.zeros(x.shape[0], dtype=torch.int32, device=x.device)
 
         x_emb = self.dropout(self.embedding(x))
-        x_dec, loss_aux = self.decoder(x_emb, seq_starts)
+        x_dec, loss_aux, new_kv = self.decoder(x_emb, seq_starts, kv_cache)
         out = torch.matmul(x_dec, self.embedding.E.T)
-        return out, loss_aux
+        # Cache-free callers (training) keep the two-tuple contract they already use
+        if kv_cache is None:
+            return out, loss_aux
+        return out, loss_aux, new_kv
 
 
 def init_weights(m):

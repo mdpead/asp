@@ -20,8 +20,11 @@ PAD_CONFIGS = [[0, 0], [0, 17], [5, 40]]
 
 def _attention(q, k, v, seq_starts, causal, compute_dtype):
     """Reference attention. GQA is expressed with repeat_interleave, so autograd's
-    backward through it performs exactly the group sum the dkdv kernel must reproduce."""
-    seq = q.shape[2]
+    backward through it performs exactly the group sum the dkdv kernel must reproduce.
+    Handles q_len < k_len with bottom-right causal alignment (queries are the last
+    q_len positions of the key sequence), matching the kernel's kv-cache convention."""
+    q_len = q.shape[2]
+    k_len = k.shape[2]
     head_dim = q.shape[3]
     ratio = q.shape[1] // k.shape[1]
 
@@ -31,10 +34,12 @@ def _attention(q, k, v, seq_starts, causal, compute_dtype):
 
     scores = (qq @ kk.transpose(-1, -2)) / (head_dim**0.5)
 
-    pos = torch.arange(seq, device=q.device)
-    mask = (pos[None, :] >= seq_starts[:, None].to(pos.dtype))[:, None, None, :]
+    q_pos = torch.arange(q_len, device=q.device)
+    kv_pos = torch.arange(k_len, device=q.device)
+    mask = (kv_pos[None, :] >= seq_starts[:, None].to(kv_pos.dtype))[:, None, None, :]
     if causal:
-        mask = mask & (pos[None, :] <= pos[:, None])[None, None]
+        # Query i sits at absolute key position i + (k_len - q_len)
+        mask = mask & (kv_pos[None, :] <= q_pos[:, None] + (k_len - q_len))[None, None]
     scores = scores.masked_fill(~mask, float("-inf"))
 
     probs = torch.softmax(scores, dim=-1)
@@ -67,10 +72,11 @@ def assert_no_worse_than_reference(actual, exact, same_precision, label, slack=2
     )
 
 
-def _inputs(batch, q_heads, kv_heads, seq, head_dim, pads, requires_grad=False):
+def _inputs(batch, q_heads, kv_heads, seq, head_dim, pads, requires_grad=False, k_seq=None):
+    k_seq = seq if k_seq is None else k_seq
     q = torch.randn(batch, q_heads, seq, head_dim, device=DEV, dtype=DTYPE, requires_grad=requires_grad)
-    k = torch.randn(batch, kv_heads, seq, head_dim, device=DEV, dtype=DTYPE, requires_grad=requires_grad)
-    v = torch.randn(batch, kv_heads, seq, head_dim, device=DEV, dtype=DTYPE, requires_grad=requires_grad)
+    k = torch.randn(batch, kv_heads, k_seq, head_dim, device=DEV, dtype=DTYPE, requires_grad=requires_grad)
+    v = torch.randn(batch, kv_heads, k_seq, head_dim, device=DEV, dtype=DTYPE, requires_grad=requires_grad)
     seq_starts = torch.tensor(pads, device=DEV, dtype=torch.int32)
     return q, k, v, seq_starts
 
@@ -164,3 +170,51 @@ def test_rejects_mismatched_seq_starts_shape():
     bad = torch.zeros(3, device=DEV, dtype=torch.int32)  # batch is 2, not 3
     with pytest.raises(AssertionError):
         flash_attention(q, k, v, bad, causal=True)
+
+
+# --- KV cache: queries cover only the last q_len positions of the key sequence ---
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(4, 4), (8, 2)])
+@pytest.mark.parametrize("q_len,k_len", [(1, 100), (7, 100), (1, 129)])
+@pytest.mark.parametrize("pads", [[0, 0], [0, 37]])
+def test_forward_kv_cache_matches_reference(q_heads, kv_heads, q_len, k_len, pads):
+    head_dim = 32
+    q, k, v, seq_starts = _inputs(len(pads), q_heads, kv_heads, q_len, head_dim, pads, k_seq=k_len)
+
+    out = flash_attention(q, k, v, seq_starts, causal=True)
+    exact = _attention(q, k, v, seq_starts, True, torch.float32)
+    same_precision = _attention(q, k, v, seq_starts, True, DTYPE)
+
+    assert not out.isnan().any(), "kernel produced NaN"
+    # Suffix queries all sit past the pad block, so every row is comparable.
+    assert_no_worse_than_reference(out, exact, same_precision, f"q_len={q_len} k_len={k_len}")
+
+
+@pytest.mark.parametrize("q_len", [1, 7])
+def test_suffix_queries_match_full_attention(q_len):
+    """A decode step must reproduce what full attention computes for the same rows —
+    the property incremental generation with a kv cache relies on."""
+    seq, head_dim, pads = 100, 32, [0, 12]
+    q, k, v, seq_starts = _inputs(len(pads), 8, 2, seq, head_dim, pads)
+
+    full = flash_attention(q, k, v, seq_starts, causal=True)
+    suffix = flash_attention(q[:, :, -q_len:], k, v, seq_starts, causal=True)
+
+    err = _max_err(suffix, full[:, :, -q_len:])
+    scale = full[:, :, -q_len:].float().abs().max().item()
+    assert err / scale < 5e-3, f"suffix rows diverge from full attention: rel {err / scale:.4g}"
+
+
+def test_rejects_more_queries_than_keys():
+    q, k, v, seq_starts = _inputs(2, 4, 2, 32, 32, [0, 0], k_seq=16)
+    with pytest.raises(AssertionError):
+        flash_attention(q, k, v, seq_starts, causal=True)
+
+
+def test_backward_rejects_kv_cache_shapes():
+    """Backward is training-only; unequal q/k lengths must fail loudly, not silently."""
+    q, k, v, seq_starts = _inputs(1, 4, 2, 8, 32, [0], requires_grad=True, k_seq=32)
+    out = flash_attention(q, k, v, seq_starts, causal=True)
+    with pytest.raises(AssertionError):
+        out.float().sum().backward()

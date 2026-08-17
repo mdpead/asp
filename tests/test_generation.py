@@ -7,8 +7,9 @@ result does not depend on what it was batched with.
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from src.generation import generate_texts
+from src.generation import generate_texts, make_kv_cache
 
 DEV = "cuda"
 
@@ -88,3 +89,45 @@ def test_no_grad_leaks(model, tokenizer):
         p.grad = None
     generate_texts(model, tokenizer, ["hello"], DEV, max_new_tokens=3)
     assert all(p.grad is None for p in model.parameters())
+
+
+def test_cached_logits_match_uncached_forward(model, tokenizer):
+    """The kv cache is an optimization, not a model change: at every step, decoding
+    with the cache must produce the same logits as a full no-cache forward over the
+    same prefix. The behavioral tests above cannot see a cache that is consistently
+    wrong (bad RoPE offset, misaligned mask, stale entries); this one can."""
+    prompts = ["hello", "the quick brown fox jumps over"]
+    prompt_ids = tokenizer(prompts, add_special_tokens=False)["input_ids"]
+    prompt_ids = [[tokenizer.bos_token_id] + ids for ids in prompt_ids]
+    encoded = tokenizer.pad({"input_ids": prompt_ids}, return_tensors="pt", padding_side="left")
+
+    input_ids = encoded["input_ids"].to(DEV)
+    batch_size, input_length = input_ids.shape
+    seq_starts = (input_length - encoded["attention_mask"].sum(dim=-1)).to(
+        device=DEV, dtype=torch.int32
+    )
+
+    new_tokens = 8
+    token_ids = F.pad(input_ids, (0, new_tokens), value=tokenizer.pad_token_id)
+    kv_cache = make_kv_cache(model, batch_size, input_length + new_tokens, DEV)
+
+    num_cached = 0
+    with torch.no_grad():
+        for cur_length in range(input_length, input_length + new_tokens):
+            cached, _, new_kv = model(
+                token_ids[:, num_cached:cur_length], seq_starts, kv_cache[..., 0:num_cached, :]
+            )
+            kv_cache[..., num_cached:cur_length, :] = new_kv
+            num_cached = cur_length
+
+            full, _ = model(token_ids[:, 0:cur_length], seq_starts)
+
+            a, b = cached[:, -1].float(), full[:, -1].float()
+            err = (a - b).abs().max().item()
+            scale = b.abs().max().item()
+            step = cur_length - input_length
+            assert err / scale < 1e-2, f"step {step}: cached logits diverge, rel {err / scale:.4g}"
+
+            # Both paths continue from the reference's greedy token, so any divergence
+            # is attributable to this step alone rather than a drifted prefix.
+            token_ids[:, cur_length] = b.argmax(dim=-1)

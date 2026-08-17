@@ -21,7 +21,7 @@ from torch import Tensor
             {"BLOCK_SIZE_Q_SEQ": 128, "BLOCK_SIZE_KV_SEQ": 128}, num_warps=8, num_stages=3
         ),
     ],
-    key=["BATCHES", "Q_HEADS", "KV_HEADS", "SEQS", "HEAD_DIMS", "causal"],
+    key=["BATCHES", "Q_HEADS", "KV_HEADS", "Q_SEQS", "KV_SEQS", "HEAD_DIMS", "causal"],
 )
 @triton.jit
 def flash_attention_forward_kernel(
@@ -35,7 +35,8 @@ def flash_attention_forward_kernel(
     BATCHES,
     Q_HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr,
-    SEQS,
+    Q_SEQS,
+    KV_SEQS,  # >= Q_SEQS with a kv cache; queries are the last Q_SEQS positions
     HEAD_DIMS: tl.constexpr,
     stride_qb,
     stride_qh,
@@ -82,7 +83,7 @@ def flash_attention_forward_kernel(
         + offsets_qs[:, None] * stride_qs
         + offsets_qd[None, :] * stride_qd
     )
-    q_tile_mask_s = offsets_qs < SEQS
+    q_tile_mask_s = offsets_qs < Q_SEQS
     q_tile_mask = q_tile_mask_s[:, None]
     q_tile = tl.load(q_tile_ptrs, q_tile_mask, other=0.0)
 
@@ -92,14 +93,17 @@ def flash_attention_forward_kernel(
     o_tile_weights = tl.zeros((BLOCK_SIZE_Q_SEQ, HEAD_DIMS), dtype=tl.float32)
     q_tile = q_tile * (1.0 / HEAD_DIMS**0.5)  # Scale q by the root dim once
 
+    # How far ahead the q seqs are from k
+    qk_seq_diff = KV_SEQS - Q_SEQS
+
     # Figure out how many kv tiles are needed depending on whether it's causal
     if causal:
         kv_tiles = min(
-            tl.cdiv((pid_s + 1) * BLOCK_SIZE_Q_SEQ, BLOCK_SIZE_KV_SEQ),
-            tl.cdiv(SEQS, BLOCK_SIZE_KV_SEQ),
+            tl.cdiv((pid_s + 1) * BLOCK_SIZE_Q_SEQ + qk_seq_diff, BLOCK_SIZE_KV_SEQ),
+            tl.cdiv(Q_SEQS + qk_seq_diff, BLOCK_SIZE_KV_SEQ),
         )
     else:
-        kv_tiles = tl.cdiv(SEQS, BLOCK_SIZE_KV_SEQ)
+        kv_tiles = tl.cdiv(KV_SEQS, BLOCK_SIZE_KV_SEQ)
     for tile_idx in range(0, kv_tiles):
         # Calculate which KV tiles to load
         offsets_kvb = pid_b
@@ -114,7 +118,7 @@ def flash_attention_forward_kernel(
             + offsets_kvs[:, None] * stride_ks
             + offsets_kvd[None, :] * stride_kd
         )
-        k_tile_mask = (offsets_kvs < SEQS)[:, None]
+        k_tile_mask = (offsets_kvs < KV_SEQS)[:, None]
         k_tile = tl.load(k_tile_ptrs, k_tile_mask, other=0.0)
 
         # Load V tile
@@ -124,17 +128,20 @@ def flash_attention_forward_kernel(
             + offsets_kvs[:, None] * stride_vs
             + offsets_kvd[None, :] * stride_vd
         )
-        v_tile_mask = (offsets_kvs < SEQS)[:, None]
+        v_tile_mask = (offsets_kvs < KV_SEQS)[:, None]
         v_tile = tl.load(v_tile_ptrs, v_tile_mask, other=0.0)
 
         # Compute scores for q,k,v tiles
         s_tile_raw = tl.dot(q_tile, k_tile.T)
         padding_mask = offsets_kvs >= seq_start
+
         if causal:
-            causal_mask = offsets_kvs[None, :] <= offsets_qs[:, None]
+            causal_mask = offsets_kvs[None, :] <= offsets_qs[:, None] + (qk_seq_diff)
             s_tile_raw = tl.where(causal_mask & padding_mask[None, :], s_tile_raw, float("-inf"))
         else:
-            s_tile_raw = tl.where((offsets_kvs < SEQS)[None, :] & padding_mask[None, :], s_tile_raw, float("-inf"))
+            s_tile_raw = tl.where(
+                (offsets_kvs < KV_SEQS)[None, :] & padding_mask[None, :], s_tile_raw, float("-inf")
+            )
         s_tile_max = tl.max(s_tile_raw, axis=-1, keep_dims=True)
 
         # Scale old scores
@@ -153,7 +160,7 @@ def flash_attention_forward_kernel(
         o_tile_weights = o_tile_weights + o_tile_partial_weights
 
     # Apply final normalisation
-    s_sum = tl.where(s_sum == 0.0, 1.0, s_sum) # In case of rows with all -inf
+    s_sum = tl.where(s_sum == 0.0, 1.0, s_sum)  # In case of rows with all -inf
     o_tile = (o_tile_weights / s_sum).to(o_ptr.dtype.element_ty)
 
     # Write out o_tile
@@ -168,7 +175,7 @@ def flash_attention_forward_kernel(
         + offsets_os[:, None] * stride_os
         + offsets_od[None, :] * stride_od
     )
-    o_tile_mask_s = offsets_os < SEQS
+    o_tile_mask_s = offsets_os < Q_SEQS
     o_tile_mask = o_tile_mask_s[:, None]
     tl.store(o_tile_ptrs, o_tile, o_tile_mask)
 
@@ -182,7 +189,7 @@ def flash_attention_forward_kernel(
     l_tile_ptrs = l_ptr + (
         offsets_lb * stride_lb + offsets_lh * stride_lh + offsets_ls[:, None] * stride_ls
     )
-    l_tile_mask = (offsets_ls < SEQS)[:, None]
+    l_tile_mask = (offsets_ls < Q_SEQS)[:, None]
 
     tl.store(l_tile_ptrs, l_tile, l_tile_mask)
 
@@ -192,13 +199,14 @@ def flash_attention_forward(
 ) -> tuple[Tensor, Tensor]:
     assert q.is_cuda and k.is_cuda and v.is_cuda and seq_starts.is_cuda
 
-    BATCHES, Q_HEADS, SEQS, HEAD_DIMS = q.shape
-    KV_HEADS = k.shape[1]
+    BATCHES, Q_HEADS, Q_SEQS, HEAD_DIMS = q.shape
+    KV_HEADS, KV_SEQS = k.shape[1], k.shape[2]
     assert Q_HEADS % KV_HEADS == 0
+    assert KV_SEQS >= Q_SEQS  # queries are the last Q_SEQS positions of the key sequence
     assert seq_starts.shape == (BATCHES,)
 
     o = torch.empty_like(q)
-    l = torch.empty((BATCHES, Q_HEADS, SEQS), dtype=torch.float32, device=q.device)
+    l = torch.empty((BATCHES, Q_HEADS, Q_SEQS), dtype=torch.float32, device=q.device)
 
     stride_qb, stride_qh, stride_qs, stride_qd = q.stride()
     stride_kb, stride_kh, stride_ks, stride_kd = k.stride()
@@ -207,7 +215,7 @@ def flash_attention_forward(
     stride_lb, stride_lh, stride_ls = l.stride()
     stride_ss = seq_starts.stride(0)
 
-    grid = lambda meta: (BATCHES, Q_HEADS, triton.cdiv(SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
+    grid = lambda meta: (BATCHES, Q_HEADS, triton.cdiv(Q_SEQS, meta["BLOCK_SIZE_Q_SEQ"]))
     flash_attention_forward_kernel[grid](
         q,
         k,
@@ -219,7 +227,8 @@ def flash_attention_forward(
         BATCHES,
         Q_HEADS,
         KV_HEADS,
-        SEQS,
+        Q_SEQS,
+        KV_SEQS,
         HEAD_DIMS,
         stride_qb,
         stride_qh,
@@ -643,7 +652,6 @@ def flash_attention_backward_kernel_dkdv(
         q_tile_start_idx = 0
     q_tile_end_idx = tl.cdiv(SEQS, BLOCK_SIZE_Q_SEQ)
 
-
     dk_tile = tl.zeros((BLOCK_SIZE_KV_SEQ, HEAD_DIMS), dtype=tl.float32)
     dv_tile = tl.zeros((BLOCK_SIZE_KV_SEQ, HEAD_DIMS), dtype=tl.float32)
 
@@ -778,6 +786,9 @@ def flash_attention_backward(
 
     BATCHES, Q_HEADS, SEQS, HEAD_DIMS = q.shape
     KV_HEADS = k.shape[1]
+    # Backward is training-only, where q and k always cover the same positions; the
+    # unequal-length (kv cache) case runs under no_grad and never reaches here
+    assert k.shape[2] == SEQS
     assert seq_starts.shape == (BATCHES,)
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -936,5 +947,5 @@ class FlashAttentionFunction(torch.autograd.Function):
         return dq, dk, dv, None, None
 
 
-def flash_attention(q: Tensor, k: Tensor, v: Tensor, seq_starts: Tensor, causal: bool=False):
+def flash_attention(q: Tensor, k: Tensor, v: Tensor, seq_starts: Tensor, causal: bool = False):
     return FlashAttentionFunction.apply(q, k, v, seq_starts, causal)
