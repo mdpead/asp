@@ -168,12 +168,6 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
         results.append(result)
         logging.info(result)
 
-        # Reset counters
-        batch_tokens = 0
-        start_time = time.time()
-        total_loss_ce = 0.0
-        total_loss_aux = 0.0
-
         # Validation step
         if step_no % validation_steps == 0:
             validation_result = validation_step(
@@ -198,6 +192,12 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
         del batch, logits, loss, loss_ce, loss_aux, scaled_loss
         if cache_clear_steps and step_no % cache_clear_steps == 0:
             torch.cuda.empty_cache()
+
+        # Reset counters
+        batch_tokens = 0
+        start_time = time.time()
+        total_loss_ce = 0.0
+        total_loss_aux = 0.0
 
         # Stop after num_steps
         if step_no >= num_steps:
