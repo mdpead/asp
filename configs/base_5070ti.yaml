@@ -1,0 +1,56 @@
+name: base
+seed: 0
+
+# Sized for an 8GB card (RTX 5070 Laptop, ~6.4GB free after the display). Measured peak
+# allocation is 4.6GB compiled; exceeding free VRAM makes CUDA spill to host memory over
+# PCIe, which costs ~8x throughput rather than raising OutOfMemoryError, so headroom here
+# is a performance decision, not just a safety one.
+model:
+  d_model: 768
+  num_heads: 12
+  num_kv_heads: 4    # GQA: groups of 3 query heads share a K/V head
+  d_h: 64            # num_heads * d_h == d_model, so attention doesn't bottleneck
+  max_length: 512
+  d_ff: 1024         # hidden dim per expert
+  num_experts: 4     # 4 rather than 8: top_k is unchanged so active params stay ~100M,
+                     # but total params (and so optimiser state) halve to fit in VRAM
+  top_k: 2           # experts active per token (Mixtral-style)
+  num_layers: 12
+  dropout: 0.0       # single pass over a large corpus, so no regularisation needed
+
+train:
+  pretrain:
+    effective_batch_token_size: 131072
+    minibatch_token_size: 2048     # -> batch of 4 at max_length 512; 64 accumulation steps
+    learning_rate: 8.0e-4  # 1 / sqrt(d_model * warm_up_steps)
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 20000               # ~2.6B tokens, ~26 per active param (compute-optimal)
+    label_smoothing: 0.0
+    router_aux_loss_coef: 0.01     # weight on the MoE load-balancing loss (Switch Transformer default)
+    device: cuda
+    checkpoint_steps: 2000         # ~1.9GB per checkpoint and nothing prunes them
+    warm_up_steps: 2000
+    validation_steps: 500
+    validation_batches: 5          # multiplied by grad_accum_steps (64), so 320 minibatches
+    compile_model: true            # cuts peak memory ~10% as well as adding throughput
+    num_workers: 4
+    prefetch_factor: 2
+    cache_clear_steps: 100
+
+data:
+  pretrain:
+    name: starcoder
+    test_split_ratio: 0.001
+    # No sample_size: loads the full python subset (tens of GB, cached to disk).
+    # Add sample_size to switch to the streamed sample path used by configs/test.yaml —
+    # but note that path materialises every sampled file in RAM, so it does not scale to
+    # the ~1M files a full run consumes.
+
+tokenizer:
+  vocab_size: 32000
+  training_size: 50000   # source files used to train BPE, not the training corpus size
+
+locations:
+  data_dir: ./data
+  models_dir: ./models
