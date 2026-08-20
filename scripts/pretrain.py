@@ -1,7 +1,5 @@
 from src import data, tokenizer, model, train, utils, dataloader
 import logging
-import argparse
-import yaml
 
 
 # Everything runs under a __main__ guard: DataLoader workers re-import this module
@@ -11,32 +9,22 @@ def main():
 
     logging.basicConfig(level=logging.INFO)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True, help="Config name (e.g. base, test)")
-    args = parser.parse_args()
+    config = utils.parse_config()
+    utils.init_run(config, "pretrain")
 
-    with open(f"configs/{args.config}.yaml") as f:
-        config = yaml.safe_load(f)
+    ds_raw = data.get_dataset_pretrain(config)
 
-    utils.init_run(config)
-
-    # Pretrain
-
-    ds_raw = data.get_dataset("pretrain", config)
-
+    # Trains the BPE on first run and loads it after, which is why the raw dataset has to
+    # exist before this line: it is the corpus the vocabulary is built from.
     token = tokenizer.get_tokenizer(ds_raw, config)
 
-    ds = data.prepare_dataset("pretrain", ds_raw, token, config)
+    ds = data.prepare_pretrain(ds_raw, token, config)
 
-    dataloaders = dataloader.create_dataloaders("pretrain", ds, token, config)
+    dataloaders = dataloader.create_dataloaders_pretrain(ds, token, config)
 
     transformer = model.build_transformer(config)
 
     train.train("pretrain", transformer, dataloaders, token, config)
-
-    # SFT
-
-    # RL
 
 
 if __name__ == "__main__":

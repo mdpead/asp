@@ -2,7 +2,7 @@ import os
 import itertools
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers, processors, decoders
 from transformers import PreTrainedTokenizerFast
-from src import utils
+from src import data, utils
 
 
 def create_tokenizer(ds, tokenizer_config):
@@ -20,7 +20,7 @@ def create_tokenizer(ds, tokenizer_config):
     )
 
     train_iter = itertools.islice(
-        (example["content"] for example in ds["train"]),
+        (data.strip_markers(example["content"]) for example in ds["train"]),
         tokenizer_config["training_size"],
     )
     tokenizer.train_from_iterator(train_iter, trainer)

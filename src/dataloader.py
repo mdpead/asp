@@ -67,11 +67,6 @@ class TokenSampler(BatchSampler):
         return len(self.batches)
 
 
-SAMPLERS = {
-    "token": TokenSampler,
-}
-
-
 def collate_batch(batch, pad_token_id):
 
     output = {}
@@ -96,26 +91,26 @@ def collate_batch(batch, pad_token_id):
     return output
 
 
-
 def collate_lm_batch(batch, pad_token_id):
     input_ids = torch.stack(batch)
     padding_mask = (input_ids != pad_token_id).bool()
     return {
         "input_ids": input_ids[:, :-1],
         "padding_mask": padding_mask[:, :-1],
-        "output_ids": input_ids[:, 1:],
+        # CrossEntropyLoss requires Long targets. A no-op while with_format("torch") hands
+        # back int64, but the ids are stored int32 and this is the only place that would
+        # break if that ever changed.
+        "output_ids": input_ids[:, 1:].long(),
     }
 
 
-def create_dataloaders(
-    stage,
+def create_dataloaders_pretrain(
     ds,
     tokenizer,
     config,
 ):
 
-    train_config = config["train"][stage]
-    sampler_name = train_config.get("sampler")
+    train_config = config["train"]["pretrain"]
     num_workers = train_config.get("num_workers", 0)
     prefetch_factor = train_config.get("prefetch_factor", 2) if num_workers > 0 else None
 
@@ -124,30 +119,15 @@ def create_dataloaders(
         split_num_workers = 0 if split == "test" else num_workers
         split_prefetch_factor = None if split_num_workers == 0 else prefetch_factor
 
-        if sampler_name:
-            sampler_cls = SAMPLERS.get(sampler_name)
-            if sampler_cls is None:
-                raise ValueError(f"Unknown sampler: {sampler_name}")
-            dataloaders[split] = DataLoader(
-                ds[split],
-                batch_sampler=sampler_cls(
-                    ds[split], train_config["minibatch_token_size"], config["seed"]
-                ),
-                collate_fn=partial(collate_batch, pad_token_id=tokenizer.pad_token_id),
-                pin_memory=True,
-                num_workers=split_num_workers,
-                prefetch_factor=split_prefetch_factor,
-            )
-        else:
-            batch_size = train_config["minibatch_token_size"] // config["model"]["max_length"]
-            sampler = InfiniteRandomSampler(ds[split], config["seed"]) if split == "train" else None
-            dataloaders[split] = DataLoader(
-                ds[split],
-                batch_size=batch_size,
-                sampler=sampler,
-                collate_fn=partial(collate_lm_batch, pad_token_id=tokenizer.pad_token_id),
-                pin_memory=True,
-                num_workers=split_num_workers,
-                prefetch_factor=split_prefetch_factor,
-            )
+        batch_size = train_config["minibatch_token_size"] // config["model"]["max_length"]
+        sampler = InfiniteRandomSampler(ds[split], config["seed"]) if split == "train" else None
+        dataloaders[split] = DataLoader(
+            ds[split],
+            batch_size=batch_size,
+            sampler=sampler,
+            collate_fn=partial(collate_lm_batch, pad_token_id=tokenizer.pad_token_id),
+            pin_memory=True,
+            num_workers=split_num_workers,
+            prefetch_factor=split_prefetch_factor,
+        )
     return dataloaders

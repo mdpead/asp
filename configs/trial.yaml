@@ -8,7 +8,7 @@ model:
   num_heads: 12
   num_kv_heads: 4
   d_h: 64
-  max_length: 512
+  max_length: 1024
   d_ff: 1024
   num_experts: 4
   top_k: 2
@@ -27,6 +27,7 @@ train:
     router_aux_loss_coef: 0.01
     device: cuda
     checkpoint_steps: 6
+    keep_checkpoints: 2
     warm_up_steps: 2000
     validation_steps: 6
     validation_batches: 1
@@ -37,8 +38,9 @@ train:
 
 data:
   pretrain:
-    name: starcoder
-    sample_size: 4000
+    num_shards: 1           # No sample_size: trial exists so tokens/sec extrapolates to a
+                            # base run, which needs the same memory-mapped arrow dataset and
+                            # worker behaviour, not an in-memory slice of it.
     test_split_ratio: 0.01
 
 tokenizer:

@@ -6,7 +6,9 @@ model:
   num_heads: 4
   num_kv_heads: 2    # GQA: groups of 2 query heads share a K/V head
   d_h: 64
-  max_length: 64
+  max_length: 256    # Not smaller: a traced easy-tier synth task runs 93-177 tokens, so a
+                     # 64-token context drops every SFT row and the stage cannot be smoke
+                     # tested at all. Still tiny next to the 1024 the base configs use.
   d_ff: 1024
   num_experts: 4     # total experts per MoE layer
   top_k: 2           # experts active per token (Mixtral-style)
@@ -25,6 +27,7 @@ train:
     router_aux_loss_coef: 0.01     # weight on the MoE load-balancing loss (Switch Transformer default)
     device: cuda
     checkpoint_steps: 100
+    keep_checkpoints: 2
     warm_up_steps: 5
     validation_steps: 20
     validation_batches: 1
@@ -35,8 +38,23 @@ train:
 
 data:
   pretrain:
-    name: starcoder
-    sample_size: 1000       # streamed sample path; base loads the full subset
+    num_shards: 1           # 380MB, and it is shard 0, which the base configs need anyway
+    sample_size: 2500       # then capped, so the map stays fast while developing. Enough
+                            # that 200 steps x 16384 tokens stays inside one epoch — at
+                            # 1000 it needed 12800 blocks and had 6579.
+    test_split_ratio: 0.1
+  sft:
+    num_records: 200        # records, before the fan-out over `tasks`
+    tier: easy              # max_depth 0: straight-line code, the tier a small model can do
+    tasks: [output]         # synth task formatters to emit: output and/or input prediction
+    inputs_per_fn: 4        # sampled inputs per generated function
+    with_trace: true        # executed-line trace in the completion, as chain of thought
+    test_split_ratio: 0.1
+  rl:
+    num_records: 200
+    tier: easy
+    tasks: [output]
+    inputs_per_fn: 4
     test_split_ratio: 0.1
 
 tokenizer:

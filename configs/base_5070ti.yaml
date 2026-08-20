@@ -1,51 +1,68 @@
-name: base
+name: base_5070ti
 seed: 0
 
-# Sized for an 8GB card (RTX 5070 Laptop, ~6.4GB free after the display). Measured peak
-# allocation is 4.6GB compiled; exceeding free VRAM makes CUDA spill to host memory over
-# PCIe, which costs ~8x throughput rather than raising OutOfMemoryError, so headroom here
-# is a performance decision, not just a safety one.
+# Sized for a 16GB card (RTX 5070 Ti desktop). The laptop config is memory-bound at 8GB;
+# this card has twice the VRAM and roughly 2.5x the throughput, so both levers move and
+# this is a larger model on a correspondingly larger token budget rather than the same
+# model run faster. 352M total params at 16 bytes each (fp32 master + grad + two Adam
+# moments under AMP) is 5.6GB of persistent state before a single activation; confirm the
+# peak with torch.cuda.max_memory_allocated() over a few hundred steps before committing
+# to a full run, and raise minibatch_token_size if there is headroom.
 model:
-  d_model: 768
-  num_heads: 12
-  num_kv_heads: 4    # GQA: groups of 3 query heads share a K/V head
+  d_model: 1024
+  num_heads: 16
+  num_kv_heads: 4    # GQA: groups of 4 query heads share a K/V head
   d_h: 64            # num_heads * d_h == d_model, so attention doesn't bottleneck
-  max_length: 512
-  d_ff: 1024         # hidden dim per expert
-  num_experts: 4     # 4 rather than 8: top_k is unchanged so active params stay ~100M,
-                     # but total params (and so optimiser state) halve to fit in VRAM
+  max_length: 1024   # Matches the laptop config: at 512, 19% of medium-tier and 65% of
+                     # hard-tier synth traces overflow the context, and RL rollouts need
+                     # headroom above that again.
+  d_ff: 1408         # 11 * 128, so tensor-core aligned; with top_k 2 the effective FFN
+                     # width per token is 2816, or 2.75x d_model, matching the laptop ratio
+  num_experts: 4     # Not 8, even with the extra VRAM: optimiser state is charged on total
+                     # params, not active, and 8 experts at this d_model would be 628M
+                     # total (10GB of state). At 16GB you get wider MoE or wider dense
+                     # dims, not both, and the dense dims also buy compute-optimal scale.
   top_k: 2           # experts active per token (Mixtral-style)
-  num_layers: 12
+  num_layers: 16     # d_model / num_layers == 64, the same aspect ratio as the laptop
   dropout: 0.0       # single pass over a large corpus, so no regularisation needed
 
 train:
   pretrain:
     effective_batch_token_size: 131072
-    minibatch_token_size: 2048     # -> batch of 4 at max_length 512; 64 accumulation steps
-    learning_rate: 8.0e-4  # 1 / sqrt(d_model * warm_up_steps)
+    minibatch_token_size: 4096     # -> batch of 4 at max_length 1024; 32 accumulation steps
+    learning_rate: 7.0e-4          # 1 / sqrt(d_model * warm_up_steps)
     adam_betas: [0.9, 0.95]
     adam_eps: 1.0e-8
-    num_steps: 20000               # ~2.6B tokens, ~26 per active param (compute-optimal)
+    num_steps: 35000               # ~4.6B tokens against 213M active params, so ~21.5 per
+                                   # active param — near the Chinchilla point for the ~3.7x
+                                   # larger compute budget this card affords
     label_smoothing: 0.0
     router_aux_loss_coef: 0.01     # weight on the MoE load-balancing loss (Switch Transformer default)
     device: cuda
-    checkpoint_steps: 2000         # ~1.9GB per checkpoint and nothing prunes them
+    checkpoint_steps: 5000         # 4.2GB per checkpoint at 352M total params
+    keep_checkpoints: 3            # 7 would accumulate to ~29GB; 3 is ~12.6GB and still
+                                   # leaves a fallback if the newest is mid-write or corrupt.
+                                   # Omit the key to keep every checkpoint.
     warm_up_steps: 2000
     validation_steps: 500
-    validation_batches: 5          # multiplied by grad_accum_steps (64), so 320 minibatches
+    validation_batches: 3          # multiplied by grad_accum_steps (32), so 96 minibatches
     compile_model: true            # cuts peak memory ~10% as well as adding throughput
-    num_workers: 4
-    prefetch_factor: 2
-    cache_clear_steps: 100
+    num_workers: 8
+    prefetch_factor: 4
+    # No cache_clear_steps: empty_cache() is a fragmentation workaround for a card with no
+    # headroom, and it forces a sync and releases blocks the allocator would have reused.
 
 data:
   pretrain:
-    name: starcoder
     test_split_ratio: 0.001
-    # No sample_size: loads the full python subset (tens of GB, cached to disk).
-    # Add sample_size to switch to the streamed sample path used by configs/test.yaml —
-    # but note that path materialises every sampled file in RAM, so it does not scale to
-    # the ~1M files a full run consumes.
+    num_shards: 21         # 35000 steps x 131072 tokens = 4.59B tokens needed. A shard is
+                           # 1.048GB of source, ~269M tokens at ~3.9 bytes/token, so 18
+                           # cover the budget and 21 leaves margin to stay single-epoch.
+                           # ~22GB downloaded instead of ~62GB. Do not derive this from
+                           # num_steps: num_steps is resumable, but data.pretrain is part of
+                           # the stage fingerprint, so a derived value would wipe the run
+                           # every time the step budget moved. Omit to load all 59 shards.
+    # sample_size caps the loaded rows on top of this, which only the toy configs want.
 
 tokenizer:
   vocab_size: 32000

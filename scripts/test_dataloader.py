@@ -14,7 +14,7 @@ print("Loading tokenizer...")
 token = tokenizer.get_tokenizer(ds_raw, config)
 
 print("Preparing dataset...")
-ds = data.prepare_dataset("pretrain", ds_raw, token, config)
+ds = data.prepare_pretrain(ds_raw, token, config)
 
 print("Creating dataloaders...")
 dls = dataloader.create_dataloaders("pretrain", ds, config)

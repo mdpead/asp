@@ -86,6 +86,7 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
     )
     num_steps = train_config["num_steps"]
     checkpoint_steps = train_config["checkpoint_steps"]
+    keep_checkpoints = train_config.get("keep_checkpoints")
     validation_steps = train_config["validation_steps"]
     validation_batches = train_config["validation_batches"]
     max_length = config["model"]["max_length"]
@@ -186,7 +187,9 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
 
         # Checkpointing
         if step_no % checkpoint_steps == 0:
-            save_checkpoint(model, optimiser, lr_scheduler, scaler, run_path, step_no, results)
+            save_checkpoint(
+                model, optimiser, lr_scheduler, scaler, run_path, step_no, results, keep_checkpoints
+            )
 
         # Delete tensors to free up memory
         del batch, logits, loss, loss_ce, loss_aux, scaled_loss
@@ -206,7 +209,42 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
     return None
 
 
-def save_checkpoint(model, optimiser, lr_scheduler, scaler, run_path, step_no, results):
+def checkpoint_steps_on_disk(checkpoints_path):
+    """Step numbers of the checkpoints in a run, ascending. Filenames are "<step>.pt"."""
+    if not os.path.isdir(checkpoints_path):
+        return []
+    steps = []
+    for name in os.listdir(checkpoints_path):
+        stem, ext = os.path.splitext(name)
+        if ext == ".pt" and stem.isdigit():
+            steps.append(int(stem))
+    return sorted(steps)
+
+
+def _prune_checkpoints(checkpoints_path, keep):
+    """Delete all but the `keep` most recent checkpoints.
+
+    Called after the new checkpoint is written, never before, so an interrupted prune leaves
+    more checkpoints than asked for rather than none. Ordering is by step number rather than
+    mtime, so a resumed run that rewrites an existing step does not reorder history.
+    """
+    if keep is None:
+        return
+    if keep < 1:
+        raise ValueError(f"keep_checkpoints must be >= 1, got {keep}")
+
+    steps = checkpoint_steps_on_disk(checkpoints_path)
+    for step in steps[:-keep]:
+        os.remove(f"{checkpoints_path}/{step}.pt")
+    if len(steps) > keep:
+        logging.info(
+            f"Pruned {len(steps) - keep} checkpoint(s), keeping steps {steps[-keep:]}"
+        )
+
+
+def save_checkpoint(
+    model, optimiser, lr_scheduler, scaler, run_path, step_no, results, keep_checkpoints=None
+):
     checkpoints_path = f"{run_path}/checkpoints"
     os.makedirs(checkpoints_path, exist_ok=True)
 
@@ -223,6 +261,7 @@ def save_checkpoint(model, optimiser, lr_scheduler, scaler, run_path, step_no, r
     with open(f"{run_path}/results.json", "w") as f:
         json.dump(results, f)
     logging.info(f"Checkpoint saved at step {step_no}")
+    _prune_checkpoints(checkpoints_path, keep_checkpoints)
     return None
 
 
@@ -284,11 +323,11 @@ def create_run(model, train_config, tokenizer):
 
 
 def load_run(run_path, model, train_config, tokenizer):
-    checkpoints = [f for f in os.listdir(run_path + "/checkpoints") if f.endswith(".pt")]
-    if not checkpoints:
+    steps = checkpoint_steps_on_disk(f"{run_path}/checkpoints")
+    if not steps:
         raise FileNotFoundError(f"No checkpoints found in {run_path}")
 
-    checkpoint_latest_step = max([int(checkpoint.split(".")[0]) for checkpoint in checkpoints])
+    checkpoint_latest_step = steps[-1]
 
     device = torch.device(train_config["device"])
     model.to(device)
@@ -319,12 +358,7 @@ def load_run(run_path, model, train_config, tokenizer):
 
 
 def get_run(run_path, model, train_config, tokenizer):
-    checkpoints_path = f"{run_path}/checkpoints"
-    has_checkpoint = os.path.isdir(checkpoints_path) and any(
-        f.endswith(".pt") for f in os.listdir(checkpoints_path)
-    )
-
-    if has_checkpoint:
+    if checkpoint_steps_on_disk(f"{run_path}/checkpoints"):
         run = load_run(run_path, model, train_config, tokenizer)
     else:
         run = create_run(model, train_config, tokenizer)
@@ -336,7 +370,7 @@ def get_run(run_path, model, train_config, tokenizer):
 def train(stage, model, dataloaders, tokenizer, config):
 
     train_config = config["train"][stage]
-    run_path = utils.get_run_path(config)
+    run_path = utils.get_stage_path(config, stage)
     run = get_run(run_path, model, train_config, tokenizer)
 
     if run["step_no"] >= train_config["num_steps"]:
