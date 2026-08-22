@@ -218,3 +218,60 @@ def test_backward_rejects_kv_cache_shapes():
     out = flash_attention(q, k, v, seq_starts, causal=True)
     with pytest.raises(AssertionError):
         out.float().sum().backward()
+
+
+# --- Cross-check against torch's fused SDPA ---
+#
+# The reference above is our own eager maths, so a misread of the attention definition
+# would be baked into both sides. torch.nn.functional.scaled_dot_product_attention is an
+# independent implementation, and covers longer sequences than the correctness tests above
+# (which stay at seq 64 to keep the parametrised matrix cheap).
+
+SDPA_SEQS = [128, 256, 512, 1024]
+
+
+def _sdpa(q, k, v, causal, compute_dtype):
+    ratio = q.shape[1] // k.shape[1]
+    return torch.nn.functional.scaled_dot_product_attention(
+        q.to(compute_dtype),
+        k.repeat_interleave(ratio, dim=1).to(compute_dtype),
+        v.repeat_interleave(ratio, dim=1).to(compute_dtype),
+        is_causal=causal,
+    )
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(4, 4), (8, 2)])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("seq", SDPA_SEQS)
+def test_forward_matches_sdpa(q_heads, kv_heads, causal, seq):
+    batch, head_dim = 2, 64
+    q, k, v, seq_starts = _inputs(batch, q_heads, kv_heads, seq, head_dim, [0] * batch)
+
+    out = flash_attention(q, k, v, seq_starts, causal=causal)
+    exact = _sdpa(q, k, v, causal, torch.float32)
+    same_precision = _sdpa(q, k, v, causal, DTYPE)
+
+    assert not out.isnan().any(), "kernel produced NaN"
+    assert_no_worse_than_reference(out, exact, same_precision, f"sdpa seq={seq}")
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("seq", SDPA_SEQS)
+def test_backward_matches_sdpa(causal, seq):
+    batch, q_heads, kv_heads, head_dim = 2, 4, 4, 64
+    q, k, v, seq_starts = _inputs(
+        batch, q_heads, kv_heads, seq, head_dim, [0] * batch, requires_grad=True
+    )
+
+    def grads_of(fn):
+        qq, kk, vv = (x.detach().clone().requires_grad_(True) for x in (q, k, v))
+        fn(qq, kk, vv).float().pow(2).sum().backward()
+        return qq.grad, kk.grad, vv.grad
+
+    got = grads_of(lambda a, b, c: flash_attention(a, b, c, seq_starts, causal=causal))
+    exact = grads_of(lambda a, b, c: _sdpa(a, b, c, causal, torch.float32))
+    same_precision = grads_of(lambda a, b, c: _sdpa(a, b, c, causal, DTYPE))
+
+    for name, g, e, s in zip(("dq", "dk", "dv"), got, exact, same_precision):
+        assert not g.isnan().any(), f"{name} contains NaN"
+        assert_no_worse_than_reference(g, e, s, f"sdpa {name} seq={seq}")

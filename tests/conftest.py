@@ -5,13 +5,32 @@ from transformers import PreTrainedTokenizerFast
 
 from src.model import Transformer
 
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--benchmark",
+        action="store_true",
+        default=False,
+        help="also run benchmark tests (slow; they print timing tables)",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "benchmark: timing comparison, only collected with --benchmark"
+    )
+
+
 # The Triton kernels assert is_cuda, and every test path reaches them, so skip the
 # whole suite rather than failing confusingly on a CPU-only machine.
 def pytest_collection_modifyitems(config, items):
-    if not torch.cuda.is_available():
-        skip = pytest.mark.skip(reason="requires CUDA")
-        for item in items:
-            item.add_marker(skip)
+    no_cuda = pytest.mark.skip(reason="requires CUDA")
+    not_asked = pytest.mark.skip(reason="benchmark: pass --benchmark to run")
+    for item in items:
+        if not torch.cuda.is_available():
+            item.add_marker(no_cuda)
+        elif "benchmark" in item.keywords and not config.getoption("--benchmark"):
+            item.add_marker(not_asked)
 
 
 @pytest.fixture(autouse=True)
