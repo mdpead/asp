@@ -55,7 +55,9 @@ def validation_step(
         }
 
         with torch.no_grad():
-            logits, loss_aux = model(minibatch["input_ids"])
+            logits, loss_aux = model(
+                minibatch["input_ids"], padding_mask=minibatch["padding_mask"]
+            )
             loss = criterion(
                 logits.reshape(-1, logits.shape[2]), minibatch["output_ids"].reshape(-1)
             )
@@ -124,7 +126,11 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
         with amp.autocast(device_type=device.type):
 
             # Forward pass
-            logits, loss_aux = model(batch["input_ids"])
+            # The mask keeps pad tokens out of the MoE's seat assignment: they are not
+            # data, and letting them take seats would drop real tokens instead.
+            logits, loss_aux = model(
+                batch["input_ids"], padding_mask=batch["padding_mask"]
+            )
             loss_ce = criterion(
                 logits.reshape(-1, logits.shape[2]), batch["output_ids"].reshape(-1)
             )

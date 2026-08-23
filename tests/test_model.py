@@ -167,3 +167,57 @@ def test_moe_aux_loss_tracks_imbalance(make_model, tokenizer):
     assert collapsed == pytest.approx(moe.num_experts / moe.top_k, abs=0.05), \
         f"collapsed routing scored {collapsed:.4f}"
     assert collapsed > balanced
+
+
+def test_padding_content_cannot_reach_real_tokens(make_model, tokenizer):
+    """With the mask, what sits in the pad slots is irrelevant to the real tokens.
+
+    Batch shape is held fixed so capacity is identical in both calls; only the padding
+    content differs. Checks every position — mid-sequence is where the effect appears,
+    and the final position alone can pass by luck.
+    """
+    moe = make_model(len(tokenizer), capacity_factor=1.0).decoder.decoder_layers[0].feedforward
+    real = torch.randn(1, 24, 64, device=DEV, dtype=torch.float16)
+    mask = torch.zeros(1, 64, dtype=torch.bool, device=DEV)
+    mask[:, :24] = True
+
+    a, aux_a = moe(torch.cat([real, torch.randn(1, 40, 64, device=DEV, dtype=torch.float16)], 1), padding_mask=mask)
+    b, aux_b = moe(torch.cat([real, torch.zeros(1, 40, 64, device=DEV, dtype=torch.float16)], 1), padding_mask=mask)
+
+    err = (a[0, :24].float() - b[0, :24].float()).abs().max().item()
+    assert err == 0.0, f"padding content perturbed real tokens by {err:.3e}"
+    assert torch.equal(aux_a, aux_b), "aux loss counted the padding"
+
+
+def test_padding_is_invisible_when_capacity_cannot_bind(make_model, tokenizer):
+    """At a capacity no real token can overflow, padding changes nothing at all.
+
+    Capacity is derived from the padded n so that it stays a host-side constant, which
+    means padding still buys real tokens extra headroom. Remove that degree of freedom and
+    the masked path must reproduce the unpadded one exactly.
+    """
+    moe = make_model(len(tokenizer), capacity_factor=4.0).decoder.decoder_layers[0].feedforward
+    real = torch.randn(1, 24, 64, device=DEV, dtype=torch.float16)
+    padded = torch.cat([real, torch.randn(1, 40, 64, device=DEV, dtype=torch.float16)], dim=1)
+    mask = torch.zeros(1, 64, dtype=torch.bool, device=DEV)
+    mask[:, :24] = True
+
+    plain, aux_plain = moe(real)
+    masked, aux_masked = moe(padded, padding_mask=mask)
+
+    err = (masked[0, :24].float() - plain[0].float()).abs().max().item()
+    assert err == 0.0, f"padding perturbed real tokens by {err:.3e}"
+    assert torch.equal(aux_plain, aux_masked), "aux loss counted the padding"
+
+
+def test_unmasked_padding_does_perturb_real_tokens(make_model, tokenizer):
+    """The converse, so the tests above cannot pass for the wrong reason."""
+    moe = make_model(len(tokenizer), capacity_factor=1.0).decoder.decoder_layers[0].feedforward
+    real = torch.randn(1, 24, 64, device=DEV, dtype=torch.float16)
+    padded = torch.cat([real, torch.randn(1, 40, 64, device=DEV, dtype=torch.float16)], dim=1)
+
+    plain, _ = moe(real)
+    unmasked, _ = moe(padded)                      # no mask: padding competes for capacity
+
+    err = (unmasked[0, :24].float() - plain[0].float()).abs().max().item()
+    assert err > 0.0, "expected unmasked padding to contend for expert capacity"
