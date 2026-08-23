@@ -49,25 +49,38 @@ class MixtureOfExpertsFeedForward(nn.Module):
             [SwiGLUFeedForward(d_model, d_ff) for _ in range(0, num_experts)]
         )
 
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
 
         n, d = x.shape[0] * x.shape[1], x.shape[-1]
 
         x_flat = x.reshape(-1, x.shape[-1]) # (batch * seq = n, d)
+
+        # Pad tokens are not data. Without this they take expert seats, push real tokens
+        # into the overflow bin, and skew the load-balance term — and since every pad is
+        # the same token the router sends them all one way, which reads as imbalance that
+        # is not there. Capacity still derives from the padded n so it stays a host-side
+        # constant; the effect is that real tokens inherit the padding's share as headroom.
+        real = (
+            x.new_ones((n, 1), dtype=torch.bool)
+            if padding_mask is None
+            else padding_mask.reshape(n, 1)
+        )
         router_logits = self.router(x_flat)
         route_l, route_ind = torch.topk(router_logits, self.top_k, dim=-1)
         route_p = F.softmax(route_l, dim=-1) # (n, k)
         full_p = F.softmax(router_logits, dim=-1, dtype=torch.float32)  # (n, e)
 
         # Assign seats to each token
-        token_expert_oh = F.one_hot(route_ind, self.num_experts) # (n, k, e)
+        token_expert_oh = F.one_hot(route_ind, self.num_experts) * real.unsqueeze(-1) # (n, k, e)
         rank_km = token_expert_oh.permute(1,0,2).reshape(route_ind.shape[0] * self.top_k, -1).cumsum(0) - 1 # (n * k, e)
         token_expert_seat = rank_km.reshape(self.top_k, route_ind.shape[0], self.num_experts).permute(1, 0, 2) # (n, k, e)
         token_choice_seat = token_expert_seat.gather(-1, route_ind.unsqueeze(-1)).squeeze(-1) # (n, k)
 
         # Capacity
         capacity = int(self.capacity_factor * n * self.top_k/self.num_experts)
-        keep = token_choice_seat < capacity
+        # A pad never keeps its seat, so the same branch sends it to the bin below and
+        # zeroes its gate — one condition covering both overflow and padding.
+        keep = (token_choice_seat < capacity) & real
         gate = route_p * keep
         seat_safe = torch.where(keep, token_choice_seat, capacity) # (n, k)
 
@@ -98,8 +111,9 @@ class MixtureOfExpertsFeedForward(nn.Module):
 
         # Load balance is measured on the routing decision, not on what survived capacity:
         # dropping is the symptom this loss exists to prevent, so it must not hide from it.
-        expert_fracs = token_expert_oh.float().mean(dim=(0, 1))  # (e), sums to 1 so balance reads 1.0
-        expert_probs = full_p.mean(dim=0)  # (e)
+        counted = token_expert_oh.float()  # already zero on pad rows
+        expert_fracs = counted.sum(dim=(0, 1)) / counted.sum().clamp(min=1.0)  # (e), sums to 1
+        expert_probs = (full_p * real).sum(dim=0) / real.sum().clamp(min=1)  # (e)
 
         loss_aux = self.num_experts * (expert_fracs * expert_probs).sum()
 
@@ -274,10 +288,16 @@ class DecoderLayer(nn.Module):
         self.layer_norms = nn.ModuleList([RMSNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, seq_starts: Tensor, kv_cache: Tensor | None = None):
+    def forward(
+        self,
+        x: Tensor,
+        seq_starts: Tensor,
+        kv_cache: Tensor | None = None,
+        padding_mask: Tensor | None = None,
+    ):
         attn_out, new_kv = self.attention(self.layer_norms[0](x), seq_starts, kv_cache)
         x = x + self.dropout(attn_out)
-        ff_out, loss_aux = self.feedforward(self.layer_norms[1](x))
+        ff_out, loss_aux = self.feedforward(self.layer_norms[1](x), padding_mask)
         x = x + self.dropout(ff_out)
         return x, loss_aux, new_kv
 
@@ -318,12 +338,18 @@ class Decoder(nn.Module):
         )
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x: Tensor, seq_starts: Tensor, kv_cache: Tensor | None = None):
+    def forward(
+        self,
+        x: Tensor,
+        seq_starts: Tensor,
+        kv_cache: Tensor | None = None,
+        padding_mask: Tensor | None = None,
+    ):
         loss_aux_sum = 0
         new_kvs = []
         for i, layer in enumerate(self.decoder_layers):
             layer_cache = None if kv_cache is None else kv_cache[i]
-            x, loss_aux, new_kv = layer(x, seq_starts, layer_cache)
+            x, loss_aux, new_kv = layer(x, seq_starts, layer_cache, padding_mask)
             loss_aux_sum += loss_aux
             new_kvs.append(new_kv)
 
@@ -370,14 +396,20 @@ class Transformer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, seq_starts: Tensor | None = None, kv_cache: Tensor | None = None):
+    def forward(
+        self,
+        x: Tensor,
+        seq_starts: Tensor | None = None,
+        kv_cache: Tensor | None = None,
+        padding_mask: Tensor | None = None,
+    ):
         # Training right-pads, where causal masking already excludes pad keys, so no
         # leading padding to skip. Left-padded generation passes real offsets.
         if seq_starts is None:
             seq_starts = torch.zeros(x.shape[0], dtype=torch.int32, device=x.device)
 
         x_emb = self.dropout(self.embedding(x))
-        x_dec, loss_aux, new_kv = self.decoder(x_emb, seq_starts, kv_cache)
+        x_dec, loss_aux, new_kv = self.decoder(x_emb, seq_starts, kv_cache, padding_mask)
         out = torch.matmul(x_dec, self.embedding.E.T)
         # Cache-free callers (training) keep the two-tuple contract they already use
         if kv_cache is None:
