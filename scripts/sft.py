@@ -1,4 +1,4 @@
-from src import data, model, tokenizer, utils
+from src import data, model, tokenizer, train, utils
 import logging
 
 
@@ -31,12 +31,16 @@ def main():
     #     prompt positions of output_ids, which criterion's ignore_index then masks
     # dataloaders = dataloader.sft_dataloaders(ds, token, config)
 
-    # TODO training. train.get_run only knows how to resume a stage's own run, so it cannot
-    # yet start from the pretrained weights: SFT needs model_state_dict from
-    # models/<name>/pretrain/checkpoints/<latest>.pt with a fresh optimiser, scheduler and
-    # step counter. train.py:107 and :111 also assume fixed-length blocks and an
-    # InfiniteRandomSampler, neither of which holds once batches come from a batch sampler.
-    # train.train("sft", transformer, dataloaders, token, config)
+    # Starting from the pretrained weights is wired: train.load_model_weights takes
+    # model_state_dict only, with a fresh optimiser, scheduler and step counter, and
+    # train.sft.init_from_step pins which checkpoint so the saved config records it.
+    # Still TODO before this line can be uncommented: train.py:107 and :111 assume
+    # fixed-length blocks and an InfiniteRandomSampler, neither of which holds once
+    # batches come from a batch sampler.
+    # train.train(
+    #     "sft", transformer, dataloaders, token, config,
+    #     init_from=utils.get_stage_path(config, "pretrain"),
+    # )
 
     logging.warning("SFT data path ran; training is not wired up yet (see TODOs in this file)")
 

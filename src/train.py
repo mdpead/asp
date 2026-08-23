@@ -357,21 +357,66 @@ def load_run(run_path, model, train_config, tokenizer):
     }
 
 
-def get_run(run_path, model, train_config, tokenizer):
+def load_model_weights(model, from_path, device, step=None):
+    """Start a stage from another stage's weights: parameters only, nothing else.
+
+    Not a resume. The optimiser moments are estimates fitted to the previous stage's loss
+    surface, the scheduler position would hand SFT a decayed learning rate with no warmup,
+    and the step counter would report the run already finished. Only the parameters carry
+    over; everything else is built fresh for the new objective.
+
+    `step` pins which checkpoint to take. Leaving it None takes the latest, which is
+    convenient but means the stage config no longer records what actually loaded — prefer
+    pinning it so the saved config is an honest account of the run's ancestry.
+    """
+    steps = checkpoint_steps_on_disk(f"{from_path}/checkpoints")
+    if not steps:
+        raise FileNotFoundError(
+            f"No checkpoints in {from_path} to initialise from — run that stage first."
+        )
+    if step is None:
+        step = steps[-1]
+        logging.warning(
+            f"init_from_step not set; taking the latest checkpoint ({step}) from {from_path}. "
+            "Pin it in the config so this run's ancestry is recorded."
+        )
+    elif step not in steps:
+        raise FileNotFoundError(
+            f"init_from_step {step} not found in {from_path}/checkpoints (have {steps})."
+        )
+
+    model.to(device)
+    checkpoint = load_checkpoint(from_path, step, device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logging.info(f"Initialised model weights from {from_path} step {step}")
+    return step
+
+
+def get_run(run_path, model, train_config, tokenizer, init_from=None):
     if checkpoint_steps_on_disk(f"{run_path}/checkpoints"):
+        # This stage has its own history, so it resumes from that and ignores init_from
+        # entirely — the earlier stage only ever seeds the very first run.
         run = load_run(run_path, model, train_config, tokenizer)
     else:
+        if init_from is not None:
+            load_model_weights(
+                model,
+                init_from,
+                torch.device(train_config["device"]),
+                train_config.get("init_from_step"),
+            )
         run = create_run(model, train_config, tokenizer)
 
     run["run_path"] = run_path
     return run
 
 
-def train(stage, model, dataloaders, tokenizer, config):
+def train(stage, model, dataloaders, tokenizer, config, init_from=None):
+    """`init_from` is another stage's directory, whose weights seed this one's first run."""
 
     train_config = config["train"][stage]
     run_path = utils.get_stage_path(config, stage)
-    run = get_run(run_path, model, train_config, tokenizer)
+    run = get_run(run_path, model, train_config, tokenizer, init_from)
 
     if run["step_no"] >= train_config["num_steps"]:
         logging.info("Training already complete.")

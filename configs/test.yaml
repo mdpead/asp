@@ -40,6 +40,31 @@ train:
     prefetch_factor: 2
     cache_clear_steps: 50
 
+  sft:
+    effective_batch_token_size: 16384
+    minibatch_token_size: 8192
+    learning_rate: 2.0e-5           # an order under pretrain: the weights are already good
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 100
+    label_smoothing: 0.0
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 50
+    keep_checkpoints: 2
+    warm_up_steps: 5
+    validation_steps: 20
+    validation_batches: 1
+    compile_model: true
+    num_workers: 4
+    prefetch_factor: 2
+    init_from_step: 100             # which pretrain checkpoint seeds this stage. Pin it
+                                    # rather than leaving it unset: init_run snapshots this
+                                    # config beside the checkpoints, so a pinned step makes
+                                    # the snapshot an honest record of what the weights came
+                                    # from. It is fingerprinted, so repointing it clears the
+                                    # sft run, which is right — different ancestor.
+
 data:
   pretrain:
     num_shards: 1           # 380MB, and it is shard 0, which the base configs need anyway

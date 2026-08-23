@@ -31,8 +31,9 @@ def main():
     # gradient step. GRPO fits, since the rewards are binary and verifiable and no value
     # network is needed.
 
-    # TODO initialise from the SFT checkpoint under models/<name>/sft/checkpoints/, model
-    # weights only, same gap as in scripts/sft.py.
+    # Initialising from the SFT checkpoint is available now: pass
+    # init_from=utils.get_stage_path(config, "sft") and set train.rl.init_from_step,
+    # the same way scripts/sft.py starts from pretrain.
 
     logging.warning("RL data path ran; the rollout loop is not wired up yet (see TODOs)")
 

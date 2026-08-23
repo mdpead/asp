@@ -200,6 +200,14 @@ def _run_traced(source, code_obj, func, args, max_executed):
 
 def generate(n, tier="medium", seed=0, inputs_per_fn=4, with_trace=True):
     """Yield n records, sharing each generated function across several sampled inputs."""
+    # The distinctness filter below compares results across a function's inputs, so with
+    # fewer than two it can never be satisfied: every candidate is rejected and the loop
+    # spins forever instead of returning. Fail here rather than hang.
+    if inputs_per_fn < 2:
+        raise ValueError(
+            f"inputs_per_fn must be at least 2, got {inputs_per_fn}. One input cannot show "
+            "that the result depends on the arguments, which is what the task requires."
+        )
     rng = random.Random(seed)
     cfg = TIERS[tier]
     seen = set()
