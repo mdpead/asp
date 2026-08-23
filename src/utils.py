@@ -71,6 +71,29 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def _start_file_log(stage_path, stage, cleared):
+    """Tee the root logger into the stage directory, alongside that stage's checkpoints.
+
+    Training runs for days and is usually detached, so the record has to outlive whatever
+    terminal launched it. Opened in append mode: a resume continues the same file rather
+    than erasing what the attempt before it recorded.
+
+    The file handler carries timestamps the console one does not. They cost nothing and are
+    the only way to recover a steps/hour rate after the fact.
+    """
+    log_path = f"{stage_path}/{stage}.log"
+    handler = logging.FileHandler(log_path)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.info(f"--- {stage} starting, logging to {log_path} ---")
+    if cleared:
+        # Logged again here because the warning that triggered the clear was written before
+        # this handler existed, so the file would otherwise start with no explanation of why
+        # its history is missing.
+        logging.info(f"{stage_path} was cleared first: the saved config no longer matched")
+    return log_path
+
+
 def init_run(config, stage):
     """Prepare this stage's directory, clearing it if the config it depends on moved."""
     set_seed(config["seed"])
@@ -88,13 +111,20 @@ def init_run(config, stage):
             shutil.rmtree(f"{run_path}/tokenizer", ignore_errors=True)
     save_config(run_path, config)
 
+    cleared = False
     if os.path.exists(f"{stage_path}/config.json"):
         existing = load_config(stage_path)
         if _stage_fingerprint(existing, stage) != _stage_fingerprint(config, stage):
             logging.warning(f"{stage} config differs from saved config — clearing {stage_path}.")
             shutil.rmtree(stage_path)
             os.makedirs(stage_path)
+            cleared = True
     save_config(stage_path, config)
+
+    # Attached only now: the clear above would leave the handler holding an open descriptor
+    # on a deleted file, and everything logged before this point describes the previous run
+    # rather than this one.
+    _start_file_log(stage_path, stage, cleared)
     return stage_path
 
 

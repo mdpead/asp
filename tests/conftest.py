@@ -63,7 +63,14 @@ def tokenizer():
 def make_model():
     """Factory for small models. Session-scoped so weights are reused where possible."""
 
-    def _make(vocab_size, max_length=64, num_heads=4, num_kv_heads=2, num_layers=2):
+    def _make(
+        vocab_size,
+        max_length=64,
+        num_heads=4,
+        num_kv_heads=2,
+        num_layers=2,
+        capacity_factor=4.0,
+    ):
         torch.manual_seed(0)
         model = Transformer(
             d_model=64,
@@ -73,6 +80,10 @@ def make_model():
             d_ff=128,
             num_experts=4,
             top_k=2,
+            # Default high enough that no token can ever be dropped: these tests assert on
+            # shapes, masking and cache equivalence, none of which should turn on how the
+            # router happened to load an expert. Tests about capacity pass their own value.
+            capacity_factor=capacity_factor,
             num_layers=num_layers,
             vocab_size=vocab_size,
             max_length=max_length,

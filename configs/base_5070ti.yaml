@@ -23,6 +23,10 @@ model:
                      # total (10GB of state). At 16GB you get wider MoE or wider dense
                      # dims, not both, and the dense dims also buy compute-optimal scale.
   top_k: 2           # experts active per token (Mixtral-style)
+  capacity_factor: 1.25  # rows each expert reserves, as a multiple of its balanced share
+                         # (n * top_k / num_experts). The padding is computed and discarded,
+                         # so this is ~25% wasted FFN FLOPs bought against router imbalance;
+                         # tighten toward 1.1 once the realised max load is known.
   num_layers: 16     # d_model / num_layers == 64, the same aspect ratio as the laptop
   dropout: 0.0       # single pass over a large corpus, so no regularisation needed
 

@@ -12,6 +12,10 @@ model:
   d_ff: 1024
   num_experts: 4
   top_k: 2
+  capacity_factor: 1.25  # rows each expert reserves, as a multiple of its balanced share
+                         # (n * top_k / num_experts). The padding is computed and discarded,
+                         # so this is ~25% wasted FFN FLOPs bought against router imbalance;
+                         # tighten toward 1.1 once the realised max load is known.
   num_layers: 12
   dropout: 0.0
 

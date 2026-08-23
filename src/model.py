@@ -36,10 +36,14 @@ class SwiGLUFeedForward(nn.Module):
 
 
 class MixtureOfExpertsFeedForward(nn.Module):
-    def __init__(self, d_model, d_ff, num_experts, top_k):
+    def __init__(self, d_model, d_ff, num_experts, top_k, capacity_factor):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        # Rows each expert reserves, as a multiple of its balanced share. Above 1.0 it buys
+        # tolerance to router imbalance with padding it computes and throws away; at 1.0 any
+        # imbalance at all costs a token its expert.
+        self.capacity_factor = capacity_factor
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList(
             [SwiGLUFeedForward(d_model, d_ff) for _ in range(0, num_experts)]
@@ -47,31 +51,59 @@ class MixtureOfExpertsFeedForward(nn.Module):
 
     def forward(self, x):
 
-        router_logits = self.router(x)
+        n, d = x.shape[0] * x.shape[1], x.shape[-1]
+
+        x_flat = x.reshape(-1, x.shape[-1]) # (batch * seq = n, d)
+        router_logits = self.router(x_flat)
         route_l, route_ind = torch.topk(router_logits, self.top_k, dim=-1)
-        route_p = F.softmax(route_l, dim=-1)
-        full_p = F.softmax(router_logits, dim=-1, dtype=torch.float32)  # (batch, seq, e)
+        route_p = F.softmax(route_l, dim=-1) # (n, k)
+        full_p = F.softmax(router_logits, dim=-1, dtype=torch.float32)  # (n, e)
 
-        out = torch.zeros_like(x)
-        for i in range(0, self.num_experts):
-            token_expert = route_ind == i  # (batch, seq, k)
-            token_probs = (token_expert * route_p).sum(dim=-1)  # (batch, seq)
+        # Assign seats to each token
+        token_expert_oh = F.one_hot(route_ind, self.num_experts) # (n, k, e)
+        rank_km = token_expert_oh.permute(1,0,2).reshape(route_ind.shape[0] * self.top_k, -1).cumsum(0) - 1 # (n * k, e)
+        token_expert_seat = rank_km.reshape(self.top_k, route_ind.shape[0], self.num_experts).permute(1, 0, 2) # (n, k, e)
+        token_choice_seat = token_expert_seat.gather(-1, route_ind.unsqueeze(-1)).squeeze(-1) # (n, k)
 
-            token_mask = torch.any(token_expert, dim=-1)  # (batch, seq)
+        # Capacity
+        capacity = int(self.capacity_factor * n * self.top_k/self.num_experts)
+        keep = token_choice_seat < capacity
+        gate = route_p * keep
+        seat_safe = torch.where(keep, token_choice_seat, capacity) # (n, k)
 
-            tokens = x[token_mask]  # (seq_n, d_model)
-            token_expert_probs = token_probs[token_mask].unsqueeze(-1)  # (n, 1)
+        # Dispatch
+        token_idx = torch.arange(n, device=x.device).unsqueeze(1).expand(n, self.top_k) # (n, k)
+        t_flat, e_flat, s_flat = token_idx.reshape(-1), route_ind.reshape(-1), seat_safe.reshape(-1) # (n * k,)
 
-            x_ff_i = self.experts[i](tokens)  # (seq_n, d_model)
-            out[token_mask] += token_expert_probs * x_ff_i  # (batch, seq, d_model)
+        buf = x_flat.new_zeros(self.num_experts, capacity + 1, d)
+        buf[e_flat, s_flat] = x_flat[t_flat] # (e, c + 1, d)
 
-        route_oh = F.one_hot(route_ind, self.num_experts).float()  # (batch, seq, k, num_experts)
-        expert_fracs = route_oh.mean(dim=(0, 1, 2))  # (e), sums to 1 so balance reads 1.0
-        expert_probs = full_p.mean(dim=(0, 1))  # (e)
+
+        # Every expert gets the same fixed (capacity + 1, d) slice, so no shape below
+        # depends on how the router happened to distribute tokens. Row `capacity` is the
+        # overflow bin: seat_safe sends dropped assignments there and their gate is zero,
+        # so whatever it computes is discarded.
+        y = torch.stack(
+            [self.experts[i](buf[i]) for i in range(0, self.num_experts)], dim=0
+        )  # (e, c + 1, d)
+
+        # Combine. index_add_ rather than assignment because each token collects top_k
+        # results, and it is the transpose of the gather that dispatched them.
+        # Accumulate in the residual stream's dtype, which under autocast is fp32 while the
+        # experts return fp16: index_add_ demands both match, and compiling happens to paper
+        # over the mismatch, so eager runs would break alone.
+        out = x_flat.new_zeros(n, d)
+        weighted = y[e_flat, s_flat] * gate.reshape(-1, 1).to(y.dtype)
+        out.index_add_(0, t_flat, weighted.to(out.dtype))
+
+        # Load balance is measured on the routing decision, not on what survived capacity:
+        # dropping is the symptom this loss exists to prevent, so it must not hide from it.
+        expert_fracs = token_expert_oh.float().mean(dim=(0, 1))  # (e), sums to 1 so balance reads 1.0
+        expert_probs = full_p.mean(dim=0)  # (e)
 
         loss_aux = self.num_experts * (expert_fracs * expert_probs).sum()
 
-        return out, loss_aux
+        return out.reshape(x.shape), loss_aux
 
 
 class RMSNorm(nn.Module):
@@ -222,11 +254,23 @@ class Embedding(nn.Module):
 
 class DecoderLayer(nn.Module):
     def __init__(
-        self, d_model, num_heads, num_kv_heads, d_h, d_ff, num_experts, top_k, dropout, rope_layer
+        self,
+        d_model,
+        num_heads,
+        num_kv_heads,
+        d_h,
+        d_ff,
+        num_experts,
+        top_k,
+        capacity_factor,
+        dropout,
+        rope_layer,
     ):
         super().__init__()
         self.attention = GroupedQueryAttention(d_model, num_heads, num_kv_heads, d_h, rope_layer)
-        self.feedforward = MixtureOfExpertsFeedForward(d_model, d_ff, num_experts, top_k)
+        self.feedforward = MixtureOfExpertsFeedForward(
+            d_model, d_ff, num_experts, top_k, capacity_factor
+        )
         self.layer_norms = nn.ModuleList([RMSNorm(d_model) for _ in range(0, 2)])
         self.dropout = nn.Dropout(dropout)
 
@@ -248,6 +292,7 @@ class Decoder(nn.Module):
         d_ff,
         num_experts,
         top_k,
+        capacity_factor,
         num_dec_layers,
         dropout,
         max_length,
@@ -264,6 +309,7 @@ class Decoder(nn.Module):
                     d_ff,
                     num_experts,
                     top_k,
+                    capacity_factor,
                     dropout,
                     self.rope_layer,
                 )
@@ -297,6 +343,7 @@ class Transformer(nn.Module):
         d_ff,
         num_experts,
         top_k,
+        capacity_factor,
         num_layers,
         vocab_size,
         max_length,
@@ -316,6 +363,7 @@ class Transformer(nn.Module):
             d_ff,
             num_experts,
             top_k,
+            capacity_factor,
             num_layers,
             dropout,
             max_length,
@@ -358,6 +406,7 @@ def build_transformer(config):
         model_config["d_ff"],
         model_config["num_experts"],
         model_config["top_k"],
+        model_config["capacity_factor"],
         model_config["num_layers"],
         config["tokenizer"]["vocab_size"],
         model_config["max_length"],
