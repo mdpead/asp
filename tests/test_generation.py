@@ -18,16 +18,20 @@ def n_tokens(tokenizer, text):
     return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
 
-def test_returns_one_text_per_prompt(model, tokenizer):
-    out = generate_texts(model, tokenizer, ["hello", "the quick brown"], DEV, max_new_tokens=4)
+def test_returns_one_text_and_one_flag_per_prompt(model, tokenizer):
+    out, finished = generate_texts(
+        model, tokenizer, ["hello", "the quick brown"], DEV, max_new_tokens=4
+    )
     assert len(out) == 2
+    assert len(finished) == 2
+    assert all(isinstance(f, bool) for f in finished)
 
 
 def test_respects_max_new_tokens(model, tokenizer):
     prompt = "hello"
     base = n_tokens(tokenizer, prompt)
     for new in (1, 5, 12):
-        out = generate_texts(model, tokenizer, [prompt], DEV, max_new_tokens=new)
+        out, _ = generate_texts(model, tokenizer, [prompt], DEV, max_new_tokens=new)
         # eos may stop it early, so this is an upper bound
         assert n_tokens(tokenizer, out[0]) <= base + new
 
@@ -36,8 +40,8 @@ def test_output_is_independent_of_batchmates(model, tokenizer):
     """A short prompt gets a leading pad block when batched with a long one; with an
     explicit budget its result must be identical to running it alone."""
     short, long = "hello", "the quick brown fox jumps over foo bar baz"
-    alone = generate_texts(model, tokenizer, [short], DEV, max_new_tokens=15)[0]
-    batched = generate_texts(model, tokenizer, [long, short], DEV, max_new_tokens=15)[1]
+    alone = generate_texts(model, tokenizer, [short], DEV, max_new_tokens=15)[0][0]
+    batched = generate_texts(model, tokenizer, [long, short], DEV, max_new_tokens=15)[0][1]
     assert alone == batched
 
 
@@ -45,9 +49,53 @@ def test_uncapped_budget_depends_on_batch(model, tokenizer):
     """Documented consequence of the shared frontier: with no cap, the longest prompt
     in the batch sets everyone's budget. Pass max_new_tokens to avoid it."""
     short, long = "hello", "the quick brown fox jumps over foo bar baz"
-    alone = generate_texts(model, tokenizer, [short], DEV)[0]
-    batched = generate_texts(model, tokenizer, [long, short], DEV)[1]
+    alone = generate_texts(model, tokenizer, [short], DEV)[0][0]
+    batched = generate_texts(model, tokenizer, [long, short], DEV)[0][1]
     assert n_tokens(tokenizer, alone) > n_tokens(tokenizer, batched)
+
+
+def test_framing_tokens_are_stripped_from_the_text(model, tokenizer):
+    """bos, padding and eos are this function's framing, not model output.
+
+    A caller cannot remove them safely once they are in the string: scoring a rollout
+    means ast.literal_eval on the answer, and an <eos> stuck to it is a SyntaxError.
+
+    All three are forced into the stream rather than hoped for — bos is always prepended,
+    batching a short prompt with a long one produces the left padding, and <eos> is put in
+    a prompt, which the returned text echoes. Waiting for the model to emit <eos> on its
+    own would pass whether or not it is stripped, since random weights rarely reach it.
+    """
+    short = f"hello {tokenizer.eos_token} world"
+    long = "the quick brown fox jumps over foo bar baz"
+    assert tokenizer.eos_token_id in tokenizer(short, add_special_tokens=False)["input_ids"]
+
+    texts, _ = generate_texts(model, tokenizer, [long, short], DEV, max_new_tokens=15)
+
+    for text in texts:
+        for token in (tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token):
+            assert token not in text, f"{token} survived into {text!r}"
+
+
+def test_other_special_tokens_survive_generation(model, tokenizer):
+    """Reasoning markers ride in the text and callers split on them, so generation must
+    not skip special tokens wholesale — only the three framing ones go, dropped by id.
+
+    Driven through the prompt because the returned text echoes it: a decode that skipped
+    special tokens would erase the marker from that echo, whatever the model then emits.
+    """
+    marker = "<|think|>"
+    assert len(tokenizer(marker, add_special_tokens=False)["input_ids"]) == 1
+
+    texts, _ = generate_texts(
+        model, tokenizer, [f"hello {marker} world"], DEV, max_new_tokens=3
+    )
+    assert marker in texts[0]
+
+
+def test_finished_reports_eos_not_budget_exhaustion(model, tokenizer):
+    """A one-token budget cannot reach <eos>, so nothing is reported as finished."""
+    _, finished = generate_texts(model, tokenizer, ["hello"], DEV, max_new_tokens=1)
+    assert finished == [False]
 
 
 def test_prompt_is_never_truncated(model, tokenizer):
@@ -65,7 +113,7 @@ def test_prompt_filling_context_generates_nothing(model, tokenizer):
     exact = tokenizer.decode(ids)
 
     with pytest.warns(UserWarning, match="generating nothing"):
-        out = generate_texts(model, tokenizer, [exact], DEV)
+        out, _ = generate_texts(model, tokenizer, [exact], DEV)
     assert n_tokens(tokenizer, out[0]) == len(ids)
 
 

@@ -47,7 +47,10 @@ def tokenizer():
     tok.train_from_iterator(
         ["hello world foo bar baz qux " * 60, "the quick brown fox jumps over " * 60],
         trainers.BpeTrainer(
-            vocab_size=400, special_tokens=["<bos>", "<eos>", "<pad>", "<unk>"]
+            vocab_size=400,
+            # Mirrors src.tokenizer's reasoning markers. Generation must preserve tokens
+            # beyond the four framing ones, so the fixture needs at least one of them.
+            special_tokens=["<bos>", "<eos>", "<pad>", "<unk>", "<|think|>", "<|answer|>"],
         ),
     )
     return PreTrainedTokenizerFast(

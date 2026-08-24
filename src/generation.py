@@ -19,7 +19,13 @@ def make_kv_cache(model, batches, seq_length, device):
 
 
 def generate_texts(model, tokenizer, input_texts, device, max_new_tokens=None):
+    """Greedily continue each prompt, returning (texts, finished).
 
+    Each text is the prompt plus its continuation, with this function's own framing —
+    <bos>, padding, <eos> — removed and everything else the model emitted left intact.
+    `finished[i]` is True when row i stopped on <eos> rather than running out of budget,
+    which is the difference between a wrong answer and a truncated one.
+    """
     max_length = model.max_length
 
     # Encode without special tokens so we control them: <bos> leads, no trailing <eos>
@@ -89,5 +95,21 @@ def generate_texts(model, tokenizer, input_texts, device, max_new_tokens=None):
                 break
 
     model.train(training)
-    texts = tokenizer.batch_decode(token_ids[:, :cur_length], skip_special_tokens=True)
-    return texts
+
+    # Dropped because they are framing rather than content: bos is prepended above, pad
+    # fills the left padding and every position after a row finished, and eos is the stop
+    # signal, returned separately below. Decoding does not skip special tokens beyond
+    # these, so anything else the model emitted survives — reasoning markers included,
+    # which callers split on and could not recover once stripped.
+    framing = {tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer.eos_token_id}
+    texts = [
+        tokenizer.decode([i for i in row if i not in framing], skip_special_tokens=False)
+        for row in token_ids[:, :cur_length].tolist()
+    ]
+
+    # Whether each row stopped on <eos> rather than exhausting its budget, returned rather
+    # than left in the text. A truncated rollout is a different failure from a completed
+    # one that answered wrongly, and the alternative — reading it back out of the string —
+    # is what breaks scoring, since ast.literal_eval rejects an answer with <eos> stuck to
+    # it. finished is already tracked to halt decoding, so carrying it out costs nothing.
+    return texts, finished.tolist()
