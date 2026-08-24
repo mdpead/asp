@@ -1,4 +1,4 @@
-from src import data, model, tokenizer, train, utils
+from src import data, model, tokenizer, train, utils, dataloader
 import logging
 
 
@@ -22,14 +22,10 @@ def main():
 
     logging.info(f"sft rows: {  {split: len(rows) for split, rows in ds.items()} }")
 
-    model.build_transformer(config)
+    transformer = model.build_transformer(config)
 
     # TODO dataloaders. Needs, in dataloader.py:
-    #   - TokenSampler rewritten for single sequences (it currently assumes the en/cy pairs
-    #     of the translation project) so rows batch by length against a token budget
-    #   - an SFT collate that pads to the batch maximum and writes pad_token_id over the
-    #     prompt positions of output_ids, which criterion's ignore_index then masks
-    # dataloaders = dataloader.sft_dataloaders(ds, token, config)
+    dataloaders = dataloader.create_dataloaders_sft(ds, token, config)
 
     # Starting from the pretrained weights is wired: train.load_model_weights takes
     # model_state_dict only, with a fresh optimiser, scheduler and step counter, and
