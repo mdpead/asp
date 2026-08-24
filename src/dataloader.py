@@ -7,10 +7,31 @@ from functools import partial
 
 
 class InfiniteRandomSampler(Sampler):
-    def __init__(self, data_source, seed, start_index=0):
+    """Endless reshuffled row indices, resumable to an exact position.
+
+    `batch_size` is only needed to resume: this yields rows, the training loop counts
+    minibatches, and a fixed batch size is the bridge between them. It is fixed only
+    because pretrain blocks are all one length; leave it None where resume is not wanted
+    and start_minibatch will refuse rather than compute a wrong offset.
+    """
+
+    def __init__(self, data_source, seed, start_index=0, batch_size=None):
         self.n = len(data_source)
         self.seed = seed
         self.start_index = start_index
+        self.batch_size = batch_size
+
+    @property
+    def start_minibatch(self):
+        if self.batch_size is None:
+            raise ValueError("sampler built without batch_size; cannot resume by minibatch")
+        return self.start_index // self.batch_size
+
+    @start_minibatch.setter
+    def start_minibatch(self, n):
+        if self.batch_size is None:
+            raise ValueError("sampler built without batch_size; cannot resume by minibatch")
+        self.start_index = n * self.batch_size
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed)
@@ -48,9 +69,12 @@ class TokenSampler(Sampler):
     the TypeError that says no length exists.
     """
 
-    def __init__(self, ds, token_batch_size, seed):
+    def __init__(self, ds, token_batch_size, seed, start_minibatch=0):
         self.token_batch_size = token_batch_size
         self.seed = seed
+        # Each yielded item is one minibatch, so no conversion is needed here — unlike
+        # InfiniteRandomSampler, which yields rows and needs a batch size to translate.
+        self.start_minibatch = start_minibatch
         self.batches = self.generate_batches(ds)
 
     def generate_batches(self, ds):
@@ -78,10 +102,17 @@ class TokenSampler(Sampler):
     def __iter__(self):
         # Shuffle batches to introduce randomness
         rng = random.Random(self.seed)
+        skip = self.start_minibatch
         while True:
             batches = rng.sample(self.batches, len(self.batches))
-            for batch in batches:
+            # Fast-forward whole passes without yielding, drawing from the RNG as we go so
+            # a resumed run continues the shuffle rather than replaying the first pass.
+            if skip >= len(batches):
+                skip -= len(batches)
+                continue
+            for batch in batches[skip:]:
                 yield batch
+            skip = 0
 
 
 def collate_sft_batch(batch, pad_token_id):
@@ -143,7 +174,13 @@ def create_dataloaders_pretrain(
         split_prefetch_factor = None if split_num_workers == 0 else prefetch_factor
 
         batch_size = train_config["minibatch_token_size"] // config["model"]["max_length"]
-        sampler = InfiniteRandomSampler(ds[split], config["seed"]) if split == "train" else None
+        # batch_size reaches the sampler only so resume_at_minibatch can convert the training
+        # loop's minibatch count into the row offset this sampler indexes by.
+        sampler = (
+            InfiniteRandomSampler(ds[split], config["seed"], batch_size=batch_size)
+            if split == "train"
+            else None
+        )
         dataloaders[split] = DataLoader(
             ds[split],
             batch_size=batch_size,
@@ -181,3 +218,27 @@ def create_dataloaders_sft(
             prefetch_factor=split_prefetch_factor,
         )
     return dataloaders
+
+
+def resume_at_minibatch(dataloader, n_minibatches):
+    """Fast-forward a train loader past n_minibatches without reading any data.
+
+    Both samplers expose start_minibatch in the training loop's own unit and convert to
+    their native indexing themselves, so this does not need to know which stage it is
+    handed. The lookup matters: when a batch_sampler is set, DataLoader still builds a
+    plain sampler and never reads it, so writing resume state onto `.sampler` is silently
+    discarded — which is exactly how this failed before. `batch_size is None` is torch's
+    own signal for "a custom batch_sampler owns the grouping here".
+
+    The check is for a resumable sampler, not for the train split. It catches pretrain's
+    test loader, whose sampler is a stock SequentialSampler, but not SFT's, which uses the
+    same TokenSampler class as its train split. Resuming a validation loader would skip
+    batches and make validation loss incomparable across restarts, so call this on the
+    train split only.
+    """
+    sampler = dataloader.batch_sampler if dataloader.batch_size is None else dataloader.sampler
+    if not hasattr(sampler, "start_minibatch"):
+        raise TypeError(
+            f"cannot resume a {type(sampler).__name__}: it has no start_minibatch"
+        )
+    sampler.start_minibatch = n_minibatches

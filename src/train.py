@@ -9,6 +9,7 @@ import os
 import itertools
 import json
 from src import utils
+from src.dataloader import resume_at_minibatch
 
 
 class WarmupInverseSquareRootLR(LRScheduler):
@@ -109,9 +110,9 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
     total_loss_ce = 0.0
     total_loss_aux = 0.0
     # Resume exactly where we left off: skip the sampler forward in index space
-    # (no batches are read from disk for skipped positions).
-    batch_size = train_config["minibatch_token_size"] // max_length
-    dataloaders["train"].sampler.start_index = step_no * grad_accum_steps * batch_size
+    # (no batches are read from disk for skipped positions). Counted in minibatches, the
+    # unit both stages share — pretrain's sampler converts to rows, SFT's already batches.
+    resume_at_minibatch(dataloaders["train"], step_no * grad_accum_steps)
     optimiser.zero_grad(set_to_none=True)
 
     model.train()
@@ -211,6 +212,15 @@ def train_loop(stage, model, dataloaders, tokenizer, run, config):
         # Stop after num_steps
         if step_no >= num_steps:
             break
+
+    # A final save when num_steps is not a multiple of checkpoint_steps. Without it every
+    # step since the last checkpoint is discarded — the weights, and the metrics too, since
+    # save_checkpoint is also what writes results.json. Guarded so a run that ends exactly
+    # on a checkpoint boundary does not write the same step twice.
+    if step_no % checkpoint_steps != 0:
+        save_checkpoint(
+            model, optimiser, lr_scheduler, scaler, run_path, step_no, results, keep_checkpoints
+        )
 
     return None
 

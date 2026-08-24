@@ -21,6 +21,7 @@ from src.dataloader import (
     collate_sft_batch,
     create_dataloaders_pretrain,
     create_dataloaders_sft,
+    resume_at_minibatch,
 )
 
 MAX_LENGTH = 16
@@ -487,3 +488,83 @@ def test_sft_batches_have_the_shape_the_model_expects(sft_splits, tokenizer, sft
             break
     else:
         pytest.fail("train loader ended; TokenSampler should never exhaust it")
+
+
+# --- resume ---
+
+
+def _batches(sampler, n):
+    return [tuple(b) for b in _take(sampler, n)]
+
+
+@pytest.mark.parametrize("skip", [0, 1, 3, 7])
+def test_token_sampler_resumes_mid_pass(skip):
+    rows = _rows_of_length(list(range(5, 25)))
+    full = _batches(TokenSampler(rows, 64, seed=0), skip + 3)
+    resumed = _batches(TokenSampler(rows, 64, seed=0, start_minibatch=skip), 3)
+    assert resumed == full[skip:]
+
+
+def test_token_sampler_resumes_after_whole_passes():
+    """Fast-forwarding past a pass boundary must draw from the RNG, not just subtract —
+    otherwise a resumed run replays the first pass's batch order."""
+    rows = _rows_of_length(list(range(5, 25)))
+    per_pass = len(TokenSampler(rows, 64, seed=0).batches)
+    assert per_pass > 1, "need more than one batch for the boundary to exist"
+
+    full = _batches(TokenSampler(rows, 64, seed=0), per_pass + 3)
+    resumed = _batches(TokenSampler(rows, 64, seed=0, start_minibatch=per_pass), 3)
+
+    assert resumed == full[per_pass:]
+    assert resumed != full[:3]
+
+
+def test_resume_converts_minibatches_to_rows_for_pretrain(splits, tokenizer, config):
+    """The pretrain sampler indexes rows; the train loop counts minibatches. batch_size is
+    the bridge, and getting it wrong silently resumes at the wrong point in the corpus."""
+    dls = create_dataloaders_pretrain(splits, tokenizer, config)
+    batch_size = MINIBATCH_TOKENS // MAX_LENGTH
+
+    resume_at_minibatch(dls["train"], 5)
+
+    assert dls["train"].sampler.start_index == 5 * batch_size
+    assert dls["train"].sampler.start_minibatch == 5
+
+
+def test_resume_needs_no_conversion_for_sft(sft_splits, tokenizer, sft_config):
+    """TokenSampler yields whole minibatches, so the loop's unit is already its own."""
+    dls = create_dataloaders_sft(sft_splits, tokenizer, sft_config)
+
+    resume_at_minibatch(dls["train"], 5)
+
+    assert dls["train"].batch_sampler.start_minibatch == 5
+
+
+def test_resume_finds_the_sampler_that_actually_drives_iteration(sft_splits, tokenizer, sft_config):
+    """DataLoader builds a throwaway .sampler alongside a custom batch_sampler and never
+    reads it. Writing resume state there is discarded silently, which is how this failed
+    before, so the helper must reach the batch_sampler instead."""
+    dls = create_dataloaders_sft(sft_splits, tokenizer, sft_config)
+    assert not isinstance(dls["train"].sampler, TokenSampler)
+
+    resume_at_minibatch(dls["train"], 4)
+
+    assert dls["train"].batch_sampler.start_minibatch == 4
+    assert not hasattr(dls["train"].sampler, "start_minibatch")
+
+
+def test_resume_rejects_a_sampler_with_no_resume_state(splits, tokenizer, config):
+    """Pretrain's test split gets a stock SequentialSampler; silently accepting the write
+    is the failure mode this replaces."""
+    dls = create_dataloaders_pretrain(splits, tokenizer, config)
+    with pytest.raises(TypeError, match="start_minibatch"):
+        resume_at_minibatch(dls["test"], 5)
+
+
+def test_infinite_sampler_refuses_minibatch_resume_without_a_batch_size():
+    """Without batch_size there is no rows-per-minibatch, so any offset would be invented."""
+    sampler = InfiniteRandomSampler(range(NUM_BLOCKS), seed=0)
+    with pytest.raises(ValueError, match="batch_size"):
+        sampler.start_minibatch = 3
+    with pytest.raises(ValueError, match="batch_size"):
+        sampler.start_minibatch

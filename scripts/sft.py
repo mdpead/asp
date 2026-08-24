@@ -3,8 +3,7 @@ import logging
 
 
 # Supervised fine-tuning on synth execution-reasoning tasks: prompt in, trace and answer
-# out, loss on the completion only. Runs the data path today; the training call is not
-# wired up yet — see the TODOs at the bottom.
+# out, loss on the completion only.
 def main():
 
     logging.basicConfig(level=logging.INFO)
@@ -24,21 +23,17 @@ def main():
 
     transformer = model.build_transformer(config)
 
-    # TODO dataloaders. Needs, in dataloader.py:
+    # Rows are ragged here, so batches come from a TokenSampler against a token budget
+    # rather than a fixed row count.
     dataloaders = dataloader.create_dataloaders_sft(ds, token, config)
 
-    # Starting from the pretrained weights is wired: train.load_model_weights takes
-    # model_state_dict only, with a fresh optimiser, scheduler and step counter, and
-    # train.sft.init_from_step pins which checkpoint so the saved config records it.
-    # Still TODO before this line can be uncommented: train.py:107 and :111 assume
-    # fixed-length blocks and an InfiniteRandomSampler, neither of which holds once
-    # batches come from a batch sampler.
-    # train.train(
-    #     "sft", transformer, dataloaders, token, config,
-    #     init_from=utils.get_stage_path(config, "pretrain"),
-    # )
-
-    logging.warning("SFT data path ran; training is not wired up yet (see TODOs in this file)")
+    # Starting from the pretrained weights: train.load_model_weights takes model_state_dict
+    # only, with a fresh optimiser, scheduler and step counter, and train.sft.init_from_step
+    # pins which checkpoint so the saved config records it.
+    train.train(
+        "sft", transformer, dataloaders, token, config,
+        init_from=utils.get_stage_path(config, "pretrain"),
+    )
 
 
 if __name__ == "__main__":
