@@ -265,29 +265,41 @@ def _call_repr(args):
     return f"f({', '.join(repr(a) for a in args)})"
 
 
-ANSWER_MARKER = "# Answer:\n"
+# Single tokens in the trained tokenizer, so a delimiter costs one token rather than the
+# nine "# Trace:\n" takes once digits split. They also cannot occur in generated source,
+# unlike a "#" comment, so splitting on them can never catch a fragment of the function.
+THINK_OPEN, THINK_CLOSE = "<|think|>", "<|/think|>"
+ANSWER_OPEN, ANSWER_CLOSE = "<|answer|>", "<|/answer|>"
+
+
+def _wrap_trace(record, include_trace):
+    return f"{THINK_OPEN}{record['trace']}{THINK_CLOSE}" if include_trace else ""
 
 
 def format_output_task(record, include_trace):
     """Given the function and its arguments, predict the return value."""
     prompt = f"{record['source']}\n\n# What does {_call_repr(record['args'])} return?\n"
-    body = f"# Trace:\n{record['trace']}\n" if include_trace else ""
-    return prompt, body + ANSWER_MARKER + repr(record["result"])
+    body = _wrap_trace(record, include_trace)
+    return prompt, f"{body}{ANSWER_OPEN}{record['result']!r}{ANSWER_CLOSE}"
 
 
 def format_input_task(record, include_trace):
     """Given the function and a target return value, find arguments that produce it."""
     prompt = f"{record['source']}\n\n# What arguments make f return {record['result']!r}?\n"
-    body = f"# Trace:\n{record['trace']}\n" if include_trace else ""
+    body = _wrap_trace(record, include_trace)
     answer = ", ".join(repr(a) for a in record["args"])
-    return prompt, body + ANSWER_MARKER + answer
+    return prompt, f"{body}{ANSWER_OPEN}{answer}{ANSWER_CLOSE}"
 
 
 def extract_answer(completion):
     """Pull the answer text from a rollout, or None if the model never reached one."""
-    if ANSWER_MARKER not in completion:
+    if ANSWER_OPEN not in completion:
         return None
-    return completion.split(ANSWER_MARKER)[-1].strip().split("\n")[0].strip()
+    answer = completion.split(ANSWER_OPEN)[-1]
+    # Bounded by the closing marker when the rollout produced one, and by the first line
+    # break otherwise — a run that hit its token budget mid-answer still has a usable
+    # first line, and returning the whole remaining tail would never parse.
+    return answer.split(ANSWER_CLOSE)[0].strip().split("\n")[0].strip()
 
 
 def check_output_answer(record, completion):

@@ -7,12 +7,37 @@ from src import data, utils
 
 def create_tokenizer(ds, tokenizer_config):
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+
+    # digit_split puts every digit in its own pre-token, so BPE can never merge a number
+    # into one atomic id. Without it, 99% of the integers appearing in synth traces are a
+    # single token bearing no relation to their digits, and the model has to memorise each
+    # arithmetic fact per value rather than learn the operation. Read from the config
+    # rather than hardcoded because config["tokenizer"] is what the stage fingerprint
+    # compares: a change made only here would leave the saved tokenizer in place and the
+    # pretrained checkpoints valid, silently keeping the old scheme.
+    byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    if tokenizer_config.get("digit_split"):
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+            [pre_tokenizers.Digits(individual_digits=True), byte_level]
+        )
+    else:
+        tokenizer.pre_tokenizer = byte_level
     tokenizer.decoder = decoders.ByteLevel()
 
+    # Reasoning and answer delimiters, pipe-guarded so they cannot collide with the angle
+    # brackets that occur naturally in Python reprs ("<class 'int'>"). One token each
+    # rather than the four that "# Trace:\n" costs, and unlike a "#" comment they cannot
+    # appear in generated source, so extract_answer's split is unambiguous. Reserved here
+    # rather than added later because a post-hoc add_tokens would grow the vocabulary past
+    # vocab_size and so the embedding matrix past the model's.
+    #
+    # The spare slots exist so the next format idea does not cost another pretraining run:
+    # the vocabulary is fixed at training time, and adding a token later means retraining.
     special_tokens = [
         "<bos>", "<eos>", "<pad>", "<unk>",
-        "<user>", "<assistant>",
+        "<|think|>", "<|/think|>",
+        "<|answer|>", "<|/answer|>",
+        *[f"<|reserved_{i}|>" for i in range(16)],
     ]
     trainer = trainers.BpeTrainer(
         vocab_size=tokenizer_config["vocab_size"],

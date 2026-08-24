@@ -64,6 +64,9 @@ data:
 tokenizer:
   vocab_size: 32000
   training_size: 50000   # source files used to train BPE, not the training corpus size
+  digit_split: true      # every digit its own token, so arithmetic is
+                         # compositional. Without it BPE merges numbers into
+                         # atomic ids and each fact must be memorised per value.
 
 locations:
   data_dir: ./data

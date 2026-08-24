@@ -56,6 +56,38 @@ train:
     # No cache_clear_steps: empty_cache() is a fragmentation workaround for a card with no
     # headroom, and it forces a sync and releases blocks the allocator would have reused.
 
+  sft:
+    effective_batch_token_size: 32768
+    minibatch_token_size: 4096     # the budget caps padded tokens, so this is the same
+                                   # per-step memory as pretrain's 4 rows x 1024, despite
+                                   # batches here running 3-54 ragged rows
+    learning_rate: 7.0e-5          # an order under pretrain. The 1/sqrt(d_model *
+                                   # warm_up_steps) rule used there is a pretrain heuristic
+                                   # and would give 9.9e-3 at this warmup.
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 200                 # 592 minibatches/pass over 18.9k rows, 8 accumulation
+                                   # steps -> 74 optimiser steps per epoch, so ~2.7 epochs.
+                                   # 6.6M tokens, 0.14% of pretrain's budget.
+    label_smoothing: 0.0
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 100          # 4.2GB each; the final step saves regardless
+    keep_checkpoints: 2
+    warm_up_steps: 10
+    validation_steps: 10           # 20 points on the curve: this is a trial, watch it
+    validation_batches: 1          # multiplied by grad_accum_steps (8) -> 8 minibatches
+    compile_model: false           # the sampler yields 114 distinct batch widths here
+                                   # against 3 in the toy config, over torch's default
+                                   # recompile limit of 8. Automatic dynamic shapes would
+                                   # probably settle, but a compile pathology looking like
+                                   # "sft does not learn" is the worst failure for a trial.
+                                   # Costs the ~10% peak memory saving noted above.
+    num_workers: 8
+    prefetch_factor: 4
+    init_from_step: 10000          # the only trained checkpoint besides 5000, and pretrain
+                                   # is 29% done — these weights are not final
+
 data:
   pretrain:
     test_split_ratio: 0.001
@@ -68,9 +100,23 @@ data:
                            # every time the step budget moved. Omit to load all 59 shards.
     # sample_size caps the loaded rows on top of this, which only the toy configs want.
 
+  sft:
+    num_records: 20000      # -> 18,932 train / 1,068 test rows, 2.38M tokens
+    tier: easy              # straight-line code. If the recipe cannot teach this, a harder
+                            # tier tells you nothing. Medium is viable at max_length 1024
+                            # (<1% of rows overflow, against 75% at the toy config's 256)
+                            # and is the run after this one.
+    tasks: [output]
+    inputs_per_fn: 4
+    with_trace: true
+    test_split_ratio: 0.05
+
 tokenizer:
   vocab_size: 32000
   training_size: 50000   # source files used to train BPE, not the training corpus size
+  digit_split: true      # every digit its own token, so arithmetic is
+                         # compositional. Without it BPE merges numbers into
+                         # atomic ids and each fact must be memorised per value.
 
 locations:
   data_dir: ./data
