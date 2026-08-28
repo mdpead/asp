@@ -1,0 +1,95 @@
+name: sft_only
+seed: 0
+
+# Full-size model, tokenizer trained on StarCoder, but no pretraining: train.pretrain
+# runs for zero steps, which builds the vocabulary and writes the untrained weights as
+# step 0 for sft to start from. It isolates what pretraining contributes — at the toy
+# scale a 10.8M model reached 26.6% answer accuracy from random init, ahead of a 213M
+# model that had 10k pretrain steps but atomic number tokens, and the three-way
+# comparison could not say whether the tokenizer, the model size or the SFT budget
+# bought that. Here only the pretraining differs from a base run.
+model:
+  d_model: 1024
+  num_heads: 16
+  num_kv_heads: 4
+  d_h: 64
+  max_length: 1024
+  d_ff: 1408
+  num_experts: 4
+  top_k: 2
+  capacity_factor: 1.25
+  num_layers: 16
+  dropout: 0.0
+
+train:
+  pretrain:
+    # Everything here except num_steps exists because train.train reads it before
+    # deciding there is nothing to do. num_steps 0 is the whole point of this config.
+    num_steps: 0
+    effective_batch_token_size: 131072
+    minibatch_token_size: 4096
+    learning_rate: 7.0e-4
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    label_smoothing: 0.0
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 5000
+    keep_checkpoints: 1        # only step 0 is ever written
+    warm_up_steps: 2000
+    validation_steps: 500
+    validation_batches: 3
+    compile_model: false
+    num_workers: 8
+    prefetch_factor: 4
+
+  sft:
+    effective_batch_token_size: 32768
+    # 2048 rather than the 4096 inherited from base: that value was sized against
+    # pretrain's fixed 4-rows-of-1024 shape and left 408MB of headroom here. Ragged SFT
+    # batches plus a differently-shaped validation set fragment the allocator, and the
+    # first attempt collapsed from 17k to 1.3k tokens/sec at the step-200 validation and
+    # never recovered — a 70-hour projection instead of 5.
+    minibatch_token_size: 2048
+    learning_rate: 3.0e-4      # from scratch, not a gentle fine-tune off good weights
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 10000           # ~328M tokens; ~5h at the 17.9k tok/s this model showed
+    label_smoothing: 0.0
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 2000
+    keep_checkpoints: 2        # 4.2GB each
+    warm_up_steps: 200
+    validation_steps: 200
+    validation_batches: 1
+    compile_model: false       # ragged batch widths; see base
+    num_workers: 8
+    prefetch_factor: 4
+    init_from_step: 0          # the untrained checkpoint the zero-step pretrain wrote
+
+data:
+  pretrain:
+    test_split_ratio: 0.001
+    # Only the tokenizer consumes this corpus, and it reads tokenizer.training_size files
+    # from the train split. sample_size caps what prepare_pretrain then tokenises, which
+    # would otherwise chunk the whole corpus for a stage that runs zero steps.
+    num_shards: 1
+    sample_size: 60000
+
+  sft:
+    num_records: 2500000    # ~2.25M train rows at ~129 tokens: ~3 epochs over 10k steps
+    tier: easy
+    tasks: [output]
+    inputs_per_fn: 4
+    with_trace: true
+    test_split_ratio: 0.02
+
+tokenizer:
+  vocab_size: 32000
+  training_size: 50000
+  digit_split: true
+
+locations:
+  data_dir: ./data
+  models_dir: ./models

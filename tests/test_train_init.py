@@ -1,6 +1,7 @@
 """Starting a stage from an earlier stage's weights."""
 
 import copy
+import os
 
 import pytest
 import torch
@@ -177,3 +178,57 @@ def test_final_checkpoint_carries_the_results_for_its_steps(tmp_path, make_model
 
     results = json.load(open(f"{run_path}/results.json"))
     assert [e["step_no"] for e in results if e["type"] == "train"] == [1, 2, 3]
+
+
+# --- zero-step stages ---
+
+
+def test_zero_step_stage_saves_the_untrained_model(tmp_path, make_model, tokenizer):
+    """num_steps 0 writes step 0 rather than returning empty-handed.
+
+    It is how a config builds a tokenizer without pretraining: the stage runs, saves the
+    untrained weights, and the next stage initialises from them through the normal path
+    instead of needing a branch for "there is no checkpoint".
+    """
+    model = make_model(len(tokenizer)).float()
+    cfg = _loop_config(tmp_path, num_steps=0, checkpoint_steps=100)
+    cfg["train"]["pretrain"] = cfg["train"]["sft"]
+    run_path = utils.get_stage_path(cfg, "pretrain")
+
+    train.train("pretrain", model, {}, tokenizer, cfg)
+
+    assert train.checkpoint_steps_on_disk(f"{run_path}/checkpoints") == [0]
+
+
+def test_zero_step_stage_is_idempotent(tmp_path, make_model, tokenizer):
+    """Re-running must not overwrite a checkpoint that already exists."""
+    model = make_model(len(tokenizer)).float()
+    cfg = _loop_config(tmp_path, num_steps=0, checkpoint_steps=100)
+    cfg["train"]["pretrain"] = cfg["train"]["sft"]
+    run_path = utils.get_stage_path(cfg, "pretrain")
+
+    train.train("pretrain", model, {}, tokenizer, cfg)
+    first = os.path.getmtime(f"{run_path}/checkpoints/0.pt")
+    train.train("pretrain", model, {}, tokenizer, cfg)
+
+    assert os.path.getmtime(f"{run_path}/checkpoints/0.pt") == first
+
+
+def test_a_later_stage_initialises_from_the_zero_step_checkpoint(
+    tmp_path, make_model, tokenizer
+):
+    """The point of writing step 0: sft starts from it with no special case."""
+    source = make_model(len(tokenizer)).float()
+    cfg = _loop_config(tmp_path, num_steps=0, checkpoint_steps=100)
+    cfg["train"]["pretrain"] = cfg["train"]["sft"]
+    train.train("pretrain", source, {}, tokenizer, cfg)
+
+    target = make_model(len(tokenizer)).float()
+    with torch.no_grad():                      # make the two differ before loading
+        next(target.parameters()).add_(1.0)
+    assert not torch.equal(_first_param(target), _first_param(source))
+
+    train.load_model_weights(
+        target, utils.get_stage_path(cfg, "pretrain"), torch.device(DEV), step=0
+    )
+    assert torch.equal(_first_param(target), _first_param(source))
