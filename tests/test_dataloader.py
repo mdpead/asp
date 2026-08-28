@@ -11,16 +11,21 @@ shifted ids rather than a view of them. Both produce a plausible-looking loss cu
 wrong, so neither would show up as a crash during training.
 """
 
+import itertools
+
 import pytest
 import torch
 
 from src.dataloader import (
     InfiniteRandomSampler,
+    PromptSampler,
     TokenSampler,
     collate_lm_batch,
-    collate_sft_batch,
+    collate_rl_batch,
     create_dataloaders_pretrain,
+    create_dataloaders_rl,
     create_dataloaders_sft,
+    collate_sft_batch,
     resume_at_minibatch,
 )
 
@@ -28,6 +33,8 @@ MAX_LENGTH = 16
 BLOCK = MAX_LENGTH + 1  # prepare_pretrain stores one extra token for the shift
 MINIBATCH_TOKENS = 64
 NUM_BLOCKS = 20
+PROMPTS_PER_STEP = 4
+NUM_PROMPTS = 14  # deliberately not a multiple of PROMPTS_PER_STEP
 
 
 class _Blocks(torch.utils.data.Dataset):
@@ -58,7 +65,8 @@ def config():
                 "minibatch_token_size": MINIBATCH_TOKENS,
                 "num_workers": 2,
                 "prefetch_factor": 2,
-            }
+            },
+            "rl": {"minibatch_prompts_size": PROMPTS_PER_STEP},
         },
     }
 
@@ -568,3 +576,110 @@ def test_infinite_sampler_refuses_minibatch_resume_without_a_batch_size():
         sampler.start_minibatch = 3
     with pytest.raises(ValueError, match="batch_size"):
         sampler.start_minibatch
+
+
+# --- rl ---
+
+
+@pytest.fixture
+def rl_rows():
+    """Stands in for prepare_rl's output: prompt text, its token length, and the fields
+    synth's checkers need to score a rollout. Lengths are shuffled relative to index so a
+    sampler that ignored `length` would produce visibly mixed batches."""
+    lengths = [40, 12, 33, 7, 25, 19, 48, 3, 30, 15, 44, 9, 21, 37][:NUM_PROMPTS]
+    return {
+        "train": [
+            {
+                "prompt": f"def f(x): return x + {i}\n\n# What does f(1) return?\n",
+                "length": length,
+                "task": "output",
+                "source": f"def f(x): return x + {i}",
+                "args": [1],
+                "result": 1 + i,
+            }
+            for i, length in enumerate(lengths)
+        ],
+        "test": [
+            {
+                "prompt": f"def g(x): return x * {i}\n\n# What does g(2) return?\n",
+                "length": 10 + i,
+                "task": "output",
+                "source": f"def g(x): return x * {i}",
+                "args": [2],
+                "result": 2 * i,
+            }
+            for i in range(NUM_PROMPTS // 2)
+        ],
+    }
+
+
+def test_rl_collate_passes_the_scoring_fields_through(rl_rows):
+    """The reward comes from executing the record, so the row has to survive the collate."""
+    batch = collate_rl_batch(rl_rows["train"][:3])
+    assert len(batch) == 3
+    for original, collated in zip(rl_rows["train"][:3], batch):
+        assert collated == original
+    assert all(isinstance(row["prompt"], str) for row in batch), "prompts were tokenised"
+
+
+def test_prompt_sampler_fills_every_batch_but_the_last(rl_rows):
+    sampler = PromptSampler(rl_rows["train"], PROMPTS_PER_STEP, seed=0)
+    sizes = [len(b) for b in sampler.batches]
+    assert sizes[:-1] == [PROMPTS_PER_STEP] * (len(sizes) - 1)
+    assert 0 < sizes[-1] <= PROMPTS_PER_STEP
+    assert sum(sizes) == NUM_PROMPTS, "the short final batch was dropped"
+
+
+def test_prompt_sampler_groups_similar_lengths(rl_rows):
+    """Generation left-pads to the batch's longest prompt, so a batch of mixed lengths is
+    rollout compute spent on padding."""
+    rows = rl_rows["train"]
+    sampler = PromptSampler(rows, PROMPTS_PER_STEP, seed=0)
+
+    spans = [
+        max(rows[i]["length"] for i in batch) - min(rows[i]["length"] for i in batch)
+        for batch in sampler.batches
+    ]
+    whole_split = max(r["length"] for r in rows) - min(r["length"] for r in rows)
+    assert max(spans) < whole_split / 2, f"batches span nearly the whole range: {spans}"
+
+
+def test_prompt_sampler_covers_every_prompt_once_per_pass(rl_rows):
+    sampler = PromptSampler(rl_rows["train"], PROMPTS_PER_STEP, seed=0)
+    seen = [i for batch in itertools.islice(iter(sampler), len(sampler.batches)) for i in batch]
+    assert sorted(seen) == list(range(NUM_PROMPTS))
+
+
+def test_prompt_sampler_resumes_where_it_left_off(rl_rows):
+    """Same contract as TokenSampler: a resumed run continues the shuffle rather than
+    replaying the pass it already did."""
+    full = list(itertools.islice(iter(PromptSampler(rl_rows["train"], PROMPTS_PER_STEP, 0)), 6))
+    resumed = PromptSampler(rl_rows["train"], PROMPTS_PER_STEP, 0, start_minibatch=2)
+    assert list(itertools.islice(iter(resumed), 4)) == full[2:]
+
+
+def test_rl_train_loader_is_infinite_and_test_loader_is_one_pass(rl_rows, tokenizer, config):
+    loaders = create_dataloaders_rl(rl_rows, tokenizer, config)
+
+    passes = -(-NUM_PROMPTS // PROMPTS_PER_STEP)
+    taken = list(itertools.islice(loaders["train"], passes * 3))
+    assert len(taken) == passes * 3, "the train loader ran out"
+
+    test_batches = list(loaders["test"])
+    seen = [row["prompt"] for batch in test_batches for row in batch]
+    assert len(seen) == len(rl_rows["test"]), "the test loader skipped or repeated prompts"
+    assert seen == [row["prompt"] for row in rl_rows["test"]], "test order is not the split's"
+
+
+def test_rl_loaders_run_in_process(rl_rows, tokenizer, config):
+    """Workers exist to overlap tensor building with the GPU; this collate builds none."""
+    loaders = create_dataloaders_rl(rl_rows, tokenizer, config)
+    for loader in loaders.values():
+        assert loader.num_workers == 0
+
+
+def test_rl_train_loader_resumes(rl_rows, tokenizer, config):
+    """resume_at_minibatch finds the batch_sampler rather than the unused plain sampler."""
+    loaders = create_dataloaders_rl(rl_rows, tokenizer, config)
+    resume_at_minibatch(loaders["train"], 2)
+    assert loaders["train"].batch_sampler.start_minibatch == 2

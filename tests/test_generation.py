@@ -5,11 +5,13 @@ the prompt is never modified, max_new_tokens only ever reduces output, and a row
 result does not depend on what it was batched with.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from src.generation import generate_texts, make_kv_cache
+from src.generation import generate, generate_texts, make_kv_cache
 
 DEV = "cuda"
 
@@ -179,3 +181,152 @@ def test_cached_logits_match_uncached_forward(model, tokenizer):
             # Both paths continue from the reference's greedy token, so any divergence
             # is attributable to this step alone rather than a drifted prefix.
             token_ids[:, cur_length] = b.argmax(dim=-1)
+
+
+def test_completion_mask_marks_only_generated_tokens(model, tokenizer):
+    """True exactly where the model chose the token, so a row's True columns form one run.
+
+    Prompt and padding are False because nothing was decided there, and left padding sits
+    left of the shared frontier where every prompt ends, so the run starts there.
+    """
+    prompts = ["hello", "the quick brown"]
+    input_length = 1 + max(n_tokens(tokenizer, p) for p in prompts)  # +1 for <bos>
+
+    token_ids, mask, _, _, _ = generate(model, tokenizer, prompts, DEV, max_new_tokens=6)
+
+    assert mask.shape == token_ids.shape
+    assert not mask[:, :input_length].any(), "prompt or left padding marked as generated"
+    for row in mask:
+        cols = row.nonzero().flatten()
+        assert len(cols) > 0, "no generated token marked"
+        expected = torch.arange(input_length, input_length + len(cols), device=cols.device)
+        assert torch.equal(cols, expected), "masked columns are not one run from the frontier"
+
+
+def force_eos_at(model, tokenizer, monkeypatch, row, step):
+    """Make one row emit <eos> on a chosen step, whatever the random weights wanted.
+
+    Untrained weights never stop on their own, so without this the mask's <eos> handling —
+    the part RL depends on — is only ever exercised on rows that ran out of budget.
+    """
+    forward = model.forward
+    calls = {"n": 0}
+
+    def forced(*args, **kwargs):
+        logits, aux, new_kv = forward(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == step:
+            logits = logits.clone()
+            logits[row, -1] = -1e4
+            logits[row, -1, tokenizer.eos_token_id] = 1e4
+        return logits, aux, new_kv
+
+    monkeypatch.setattr(model, "forward", forced)
+
+
+def test_completion_mask_covers_eos_but_not_the_filler_after_it(model, tokenizer, monkeypatch):
+    """Stopping is a decision, so <eos> is masked in; the pad written afterwards is not."""
+    stop_step = 2
+    force_eos_at(model, tokenizer, monkeypatch, row=0, step=stop_step)
+
+    token_ids, mask, _, _, finished = generate(
+        model, tokenizer, ["hello", "the quick brown"], DEV, max_new_tokens=6
+    )
+    assert finished[0] and not finished[1], "the forced row should be the only one stopped"
+
+    stopped, running = mask[0].nonzero().flatten(), mask[1].nonzero().flatten()
+    assert len(stopped) == stop_step, "the stopped row masked in more than it generated"
+    assert token_ids[0, stopped[-1]] == tokenizer.eos_token_id, "row 0 stopped elsewhere"
+    assert not mask[0, stopped[-1] + 1 :].any(), "filler after <eos> marked as generated"
+    assert running[-1] == mask.shape[1] - 1, "an unfinished row stopped short of its budget"
+
+
+def test_seq_starts_points_at_the_first_real_token(model, tokenizer):
+    """A caller rescoring these ids has to reproduce generation's padding to see its context."""
+    token_ids, _, _, seq_starts, _ = generate(
+        model, tokenizer, ["the quick brown fox jumps", "hello"], DEV, max_new_tokens=2
+    )
+
+    assert seq_starts[0].item() == 0, "the longest prompt should carry no padding"
+    for ids, start in zip(token_ids, seq_starts):
+        start = start.item()
+        assert (ids[:start] == tokenizer.pad_token_id).all(), "real tokens before seq_start"
+        assert ids[start] == tokenizer.bos_token_id, "seq_start does not land on <bos>"
+
+
+def test_temperature_zero_is_deterministic(model, tokenizer):
+    """Eval's contract: the same prompt gives the same answer, run to run."""
+    prompts = ["hello", "the quick brown"]
+    first = generate(model, tokenizer, prompts, DEV, max_new_tokens=10)[0]
+    torch.manual_seed(1)  # a different RNG stream must not reach a greedy decode
+    second = generate(model, tokenizer, prompts, DEV, max_new_tokens=10)[0]
+    assert torch.equal(first, second)
+
+
+def test_sampling_varies_with_the_seed(model, tokenizer):
+    """And RL's: rollouts differ, or a group's advantages are all zero and nothing learns."""
+    prompts = ["hello", "the quick brown"]
+    first = generate(model, tokenizer, prompts, DEV, max_new_tokens=10, temperature=1.0)[0]
+    torch.manual_seed(1)
+    second = generate(model, tokenizer, prompts, DEV, max_new_tokens=10, temperature=1.0)[0]
+    assert first.shape != second.shape or not torch.equal(first, second)
+
+
+def test_sampling_never_draws_framing_tokens(model, tokenizer):
+    """<bos>, <pad> and <unk> are stripped at decode, so sampling one would train on a
+    token absent from the text being scored. <eos> stays drawable: stopping is a choice."""
+    token_ids, mask, _, _, _ = generate(
+        model, tokenizer, ["hello", "the quick brown"], DEV, max_new_tokens=30, temperature=1.0
+    )
+
+    drawn = token_ids[mask]
+    assert len(drawn) > 0
+    for name in ("bos", "pad", "unk"):
+        blocked = getattr(tokenizer, f"{name}_token_id")
+        assert not (drawn == blocked).any(), f"sampled <{name}>, which decoding strips"
+
+
+def test_negative_temperature_is_rejected(model, tokenizer):
+    with pytest.raises(ValueError, match="temperature"):
+        generate(model, tokenizer, ["hello"], DEV, max_new_tokens=2, temperature=-1.0)
+
+
+def test_logprobs_only_come_back_from_a_sampled_decode(model, tokenizer):
+    """Greedy has no meaningful behaviour policy to score against, so it returns None
+    rather than a buffer of zeros a caller could quietly train on."""
+    greedy = generate(model, tokenizer, ["hello"], DEV, max_new_tokens=4)
+    assert greedy[2] is None
+
+    token_ids, _, logprobs, _, _ = generate(
+        model, tokenizer, ["hello"], DEV, max_new_tokens=4, temperature=1.0
+    )
+    assert logprobs is not None
+    assert logprobs.shape == token_ids.shape
+
+
+def test_logprobs_score_the_token_actually_drawn(model, tokenizer):
+    """A near-zero temperature makes each draw near-certain, so the gathered log-prob has
+    to be near log(1) — which it only is if the gather lines up with the sampled token."""
+    prompts = ["hello", "the quick brown"]
+    sampled, mask, logprobs, _, _ = generate(
+        model, tokenizer, prompts, DEV, max_new_tokens=6, temperature=0.01
+    )
+    greedy = generate(model, tokenizer, prompts, DEV, max_new_tokens=6)[0]
+
+    assert torch.equal(sampled, greedy), "near-zero temperature diverged from greedy"
+    assert (logprobs[mask] > math.log(0.5)).all(), "a near-certain draw scored below 0.5"
+    assert (logprobs[mask] <= 0).all(), "a log-probability above log(1)"
+
+
+def test_a_finished_row_leaves_no_infinite_logprob(model, tokenizer, monkeypatch):
+    """<pad> is masked to -inf, and a finished row is filled with <pad>. Scoring the draw
+    before that overwrite is what keeps -inf out: -inf * False is nan, not 0, so one
+    finished row would otherwise poison any sum a caller takes over the mask."""
+    force_eos_at(model, tokenizer, monkeypatch, row=0, step=2)
+
+    _, mask, logprobs, _, finished = generate(
+        model, tokenizer, ["hello", "the quick brown"], DEV, max_new_tokens=6, temperature=1.0
+    )
+    assert finished[0] and not finished[1], "the forced row should be the only one stopped"
+    assert torch.isfinite(logprobs).all()
+    assert torch.isfinite((logprobs * mask).sum())

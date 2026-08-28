@@ -109,19 +109,77 @@ class TokenSampler(Sampler):
         return batches
 
     def __iter__(self):
-        # Shuffle batches to introduce randomness
-        rng = random.Random(self.seed)
-        skip = self.start_minibatch
-        while True:
-            batches = rng.sample(self.batches, len(self.batches))
-            # Fast-forward whole passes without yielding, drawing from the RNG as we go so
-            # a resumed run continues the shuffle rather than replaying the first pass.
-            if skip >= len(batches):
-                skip -= len(batches)
-                continue
-            for batch in batches[skip:]:
-                yield batch
-            skip = 0
+        return _reshuffled_forever(self.batches, self.seed, self.start_minibatch)
+
+
+class PromptSampler(TokenSampler):
+    """Fixed-size batches of similar-length prompts, endlessly reshuffled.
+
+    A prompt count rather than TokenSampler's token budget, because the two things that
+    make a budget the right unit for SFT are both absent here. A rollout's cost is
+    len(batch) * (longest prompt + max_new_tokens), and max_new_tokens is identical for
+    every row and usually the larger term, so bounding prompt tokens bounds the wrong
+    half. And the group size multiplies the batch afterwards, which a sampler counting
+    prompt tokens cannot see at all.
+
+    The count is also what keeps the loss stable: GRPO normalises advantages within each
+    prompt's group and averages over groups, so a batch that varies in prompt count varies
+    how many groups a step averages over, and with it the scale of the gradient.
+
+    Sorting by length first still earns its place — generation left-pads to the longest
+    prompt in the batch, so grouping similar lengths is what keeps the padding, and the
+    rollout compute spent on it, small. That is what prepare_rl records `length` for.
+
+    The final batch of a pass is short whenever the split does not divide evenly. It is
+    kept rather than dropped: the sort is deterministic, so the remainder is always the
+    same longest prompts, and dropping it would exclude them from training entirely.
+    """
+
+    def __init__(self, ds, prompts_per_batch, seed, start_minibatch=0):
+        self.prompts_per_batch = prompts_per_batch
+        # token_batch_size is left unset by this path — generate_batches below replaces
+        # the budget rule that reads it.
+        super().__init__(ds, None, seed, start_minibatch)
+
+    def generate_batches(self, ds):
+        lengths = [row["length"] for row in ds]
+        order = sorted(range(len(lengths)), key=lengths.__getitem__)
+        return [
+            order[i : i + self.prompts_per_batch]
+            for i in range(0, len(order), self.prompts_per_batch)
+        ]
+
+
+def _reshuffled_forever(batches, seed, skip):
+    """Yield batches forever, reshuffling each pass, resuming `skip` batches in.
+
+    Shared by both batch samplers: the resume arithmetic is the fiddly part, and having
+    one copy is what keeps a resumed run continuing the shuffle rather than replaying the
+    first pass.
+    """
+    rng = random.Random(seed)
+    while True:
+        order = rng.sample(batches, len(batches))
+        # Fast-forward whole passes without yielding, drawing from the RNG as we go so a
+        # resumed run continues the shuffle rather than replaying the first pass.
+        if skip >= len(order):
+            skip -= len(order)
+            continue
+        for batch in order[skip:]:
+            yield batch
+        skip = 0
+
+
+def collate_rl_batch(batch):
+    """Hand the rows straight through.
+
+    Nothing to tokenise or pad: generate() owns both, which is why prepare_rl leaves the
+    prompt as text. The rest of the row travels with it because scoring a rollout means
+    executing the function that produced the prompt — synth's checkers read `task`,
+    `source`, `args` and `result` off the record, and there is nowhere else to recover
+    them once the batch is a list of strings.
+    """
+    return batch
 
 
 def collate_sft_batch(batch, pad_token_id):
@@ -225,6 +283,45 @@ def create_dataloaders_sft(
             pin_memory=True,
             num_workers=split_num_workers,
             prefetch_factor=split_prefetch_factor,
+        )
+    return dataloaders
+
+
+def create_dataloaders_rl(
+    ds,
+    tokenizer,
+    config,
+):
+    """Batches of prompt rows for rollout generation.
+
+    No workers and no pinned memory, unlike the trained stages: both exist to overlap
+    tokenising and tensor-building with the GPU, and collate_rl_batch does neither. Rows
+    are already plain dicts in memory, so a worker would fork a process to hand one back.
+
+    `tokenizer` is unused and kept only so the three create_dataloaders_* functions share
+    a signature; the tokenising this stage needs happens inside generate().
+    """
+    train_config = config["train"]["rl"]
+
+    dataloaders = {}
+    for split in ds:
+        if split == "train":
+            batching = {
+                "batch_sampler": PromptSampler(
+                    ds[split], train_config["minibatch_prompts_size"], config["seed"]
+                )
+            }
+        else:
+            # One bounded pass in dataset order: a pass-rate is only comparable across
+            # steps if every measurement runs on the same prompts, and an infinite
+            # sampler here would make `for batch in loader` hang instead.
+            batching = {"batch_size": train_config["minibatch_prompts_size"], "shuffle": False}
+
+        dataloaders[split] = DataLoader(
+            ds[split],
+            collate_fn=collate_rl_batch,
+            num_workers=0,
+            **batching,
         )
     return dataloaders
 

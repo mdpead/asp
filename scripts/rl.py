@@ -1,4 +1,4 @@
-from src import data, model, tokenizer, utils
+from src import data, model, tokenizer, utils, rl, train, dataloader
 import logging
 
 
@@ -20,10 +20,18 @@ def main():
 
     logging.info(f"rl prompts: {  {split: len(rows) for split, rows in ds.items()} }")
 
-    model.build_transformer(config)
+    dataloaders = dataloader.create_dataloaders_rl(ds, token, config)
 
-    # TODO rollout sampling. generation.py decodes greedily (argmax at generation.py:88), so
-    # every rollout in a group would be identical; RL needs temperature and top-p first.
+    transformer = model.build_transformer(config)
+
+    rl.train_rl(
+        "rl",
+        transformer,
+        dataloaders,
+        token,
+        config,
+        init_from=utils.get_stage_path(config, "pretrain"),
+    )
 
     # TODO the loop itself. This is not train.train(): there are no fixed targets, so it is
     # generate a group of K rollouts per prompt -> score each with

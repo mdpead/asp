@@ -65,6 +65,46 @@ train:
                                     # from. It is fingerprinted, so repointing it clears the
                                     # sft run, which is right — different ancestor.
 
+  rl:
+    minibatch_prompts_size: 4
+    effective_prompts_size: 8
+    rollouts_per_group: 8
+    learning_rate: 1.0e-6           # an order under sft, the same way sft sits under
+                                    # pretrain. RL updates on its own samples, so a step
+                                    # large enough to shift the policy sharply changes the
+                                    # distribution the next rollouts are drawn from and the
+                                    # run has no fixed target to recover towards.
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 10
+    max_new_tokens: 160             # what the longest prompt in a batch leaves of the 256
+                                    # context. generate() caps it at the room available
+                                    # anyway, but a value over that warns on every step.
+    temperature: 1.0                # the model's own distribution. Anything else has to be
+                                    # matched exactly when the loss rescores these tokens,
+                                    # and 1.0 makes that division a no-op.
+    router_aux_loss_coef: 0.01      # the MoE load-balancing term still applies: RL trains
+                                    # the same experts, and dropping it lets routing
+                                    # collapse over a run.
+    device: cuda
+    checkpoint_steps: 50
+    keep_checkpoints: 2
+    warm_up_steps: 2                # not 0: WarmupInverseSquareRootLR takes the else branch
+                                    # at step 0 and computes base_lr * 0**0.5, which is a
+                                    # zero learning rate for the whole run.
+    validation_steps: 20
+    validation_batches: 1
+    compile_model: false            # generation changes sequence length every decode step,
+                                    # which fullgraph=True cannot hold across.
+                                    # No num_workers or prefetch_factor: both exist to
+                                    # overlap tokenising and tensor building with the GPU,
+                                    # and collate_rl_batch does neither — generate() owns
+                                    # the tokenising, so the rows travel as plain dicts.
+    init_from_step: 100
+    
+
+
+
 data:
   pretrain:
     num_shards: 1           # 380MB, and it is shard 0, which the base configs need anyway

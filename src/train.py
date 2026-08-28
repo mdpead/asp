@@ -296,9 +296,13 @@ def load_checkpoint(run_path, step_no, device=None):
 def create_training_objects(model, train_config, tokenizer):
 
     device = torch.device(train_config["device"])
+    # Defaulted rather than required: RL builds these objects too and never uses the
+    # criterion, so demanding the key would mean writing a value into its config that
+    # describes nothing the stage does. 0.0 is CrossEntropyLoss's own default, so a stage
+    # that omits it gets no smoothing rather than something chosen here.
     criterion = nn.CrossEntropyLoss(
         reduction="mean",
-        label_smoothing=train_config["label_smoothing"],
+        label_smoothing=train_config.get("label_smoothing", 0.0),
         ignore_index=tokenizer.pad_token_id,
     ).to(device)
 
@@ -427,8 +431,15 @@ def get_run(run_path, model, train_config, tokenizer, init_from=None):
     return run
 
 
-def train(stage, model, dataloaders, tokenizer, config, init_from=None):
-    """`init_from` is another stage's directory, whose weights seed this one's first run."""
+def train(stage, model, dataloaders, tokenizer, config, init_from=None, loop=None):
+    """`init_from` is another stage's directory, whose weights seed this one's first run.
+
+    `loop` is the per-stage training loop, defaulting to this module's. Everything above
+    the call to it — resume versus init_from, the zero-step checkpoint, the already-complete
+    check, compilation — is the same whatever is being trained, and the ordering between
+    those branches is load-bearing. A stage whose loop differs passes it in rather than
+    copying the block, so a fix to it cannot land in one copy and not the other.
+    """
 
     train_config = config["train"][stage]
     run_path = utils.get_stage_path(config, stage)
@@ -457,6 +468,6 @@ def train(stage, model, dataloaders, tokenizer, config, init_from=None):
     if train_config.get("compile_model", False):
         model = torch.compile(model, fullgraph=True)
 
-    train_loop(stage, model, dataloaders, tokenizer, run, config)
+    (loop or train_loop)(stage, model, dataloaders, tokenizer, run, config)
 
     return None
