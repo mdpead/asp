@@ -126,25 +126,29 @@ def _split_on_source(rows, ratio):
     }
 
 
-def get_dataset_sft(config):
-    """Prompt/completion pairs from the synth generator, one row per (record, task)."""
+def _is_test(source, ratio):
+    """Which side of the split a generated function falls on. See _split_on_source."""
+    return _hash_position(source) < ratio
+
+
+def _sft_rows(config):
+    """Yield prompt/completion rows from the synth generator, one per (record, task)."""
     ds_config = config["data"]["sft"]
     with_trace = ds_config["with_trace"]
+    ratio = ds_config["test_split_ratio"]
 
-    rows = []
     for record in _synth_records(ds_config, config["seed"], with_trace):
+        is_test = _is_test(record["source"], ratio)
         for task in ds_config["tasks"]:
             prompt, completion = _TASK_FORMATTERS[task](record, with_trace)
-            rows.append(
-                {
-                    "prompt": prompt,
-                    "completion": completion,
-                    "task": task,
-                    "source": record["source"],
-                    "n_executed": record["n_executed"],
-                }
-            )
-    return _split_on_source(rows, ds_config["test_split_ratio"])
+            yield {
+                "prompt": prompt,
+                "completion": completion,
+                "task": task,
+                "source": record["source"],
+                "n_executed": record["n_executed"],
+                "is_test": is_test,
+            }
 
 
 def get_dataset_rl(config):
@@ -172,6 +176,45 @@ def get_dataset_rl(config):
     return _split_on_source(rows, ds_config["test_split_ratio"])
 
 
+def get_dataset_sft(config):
+    """Prompt/completion rows from the synth generator, one per (record, task).
+
+    An arrow dataset, so it can be mapped and filtered without ever being resident. Rows
+    carry `is_test` rather than being partitioned here: prepare_sft applies the split
+    after tokenising, which keeps this a single generation pass — the expensive half,
+    since every generated function is executed under a tracer to produce its trace.
+    """
+    return hf_datasets.Dataset.from_generator(_sft_rows, gen_kwargs={"config": config})
+
+
+def _tokenise_sft_batch(batch, tokenizer, max_length):
+    """Map one batch of prompt/completion rows to model-ready sequences.
+
+    A batched map rather than a hand-rolled chunk loop: arrow feeds fixed-size batches in
+    and writes results straight back out, so nothing accumulates and there is no sentinel
+    or boundary condition to get wrong. Returning fewer rows than it was given is how an
+    over-long task is dropped.
+    """
+    bos_id, eos_id = tokenizer.bos_token_id, tokenizer.eos_token_id
+    prompts = tokenizer(batch["prompt"], add_special_tokens=False)["input_ids"]
+    completions = tokenizer(batch["completion"], add_special_tokens=False)["input_ids"]
+
+    carried = ("task", "source", "n_executed", "is_test")
+    out = {k: [] for k in ("ids", "prompt_len", "length") + carried}
+    for i, (prompt, completion) in enumerate(zip(prompts, completions)):
+        ids = [bos_id] + prompt + completion + [eos_id]
+        # One token longer than the context, since the input/target shift consumes one.
+        # Truncating would cut the answer off the end, so an over-long task is dropped.
+        if len(ids) > max_length + 1:
+            continue
+        out["ids"].append(ids)
+        out["prompt_len"].append(1 + len(prompt))
+        out["length"].append(len(ids) - 1)
+        for key in carried:
+            out[key].append(batch[key][i])
+    return out
+
+
 def prepare_sft(ds_raw, tokenizer, config):
     """Tokenise prompt/completion pairs into single sequences with a mask boundary.
 
@@ -179,41 +222,34 @@ def prepare_sft(ds_raw, tokenizer, config):
     output_ids = ids[1:], so the first completion target sits at output_ids[prompt_len - 1]
     and everything before it is masked. `length` is the model input length, which the
     length-bucketed sampler batches on.
+
+    Arrow in, arrow out, the same shape as prepare_pretrain. Rows stay memory-mapped
+    rather than resident: holding the corpus as Python token lists cost roughly 5KB a row
+    and capped it well below what the GPU could consume. They stay randomly indexable
+    too, which the length-bucketed sampler needs and a streaming dataset could not give.
     """
     max_length = config["model"]["max_length"]
-    bos_id, eos_id = tokenizer.bos_token_id, tokenizer.eos_token_id
 
-    prepared = {}
-    for split, rows in ds_raw.items():
-        prompts = tokenizer([row["prompt"] for row in rows], add_special_tokens=False)
-        completions = tokenizer([row["completion"] for row in rows], add_special_tokens=False)
+    prepared = ds_raw.map(
+        _tokenise_sft_batch,
+        batched=True,
+        batch_size=1000,
+        remove_columns=ds_raw.column_names,
+        fn_kwargs={"tokenizer": tokenizer, "max_length": max_length},
+        desc="Tokenizing sft",
+    )
+    dropped = len(ds_raw) - len(prepared)
+    if dropped:
+        logging.warning(
+            f"sft: dropped {dropped}/{len(ds_raw)} rows over max_length {max_length}"
+        )
 
-        kept, dropped = [], 0
-        for row, prompt, completion in zip(
-            rows, prompts["input_ids"], completions["input_ids"]
-        ):
-            ids = [bos_id] + prompt + completion + [eos_id]
-            # One token longer than the context, since the input/target shift consumes one.
-            # Truncating would cut the answer off the end, so an over-long task is dropped.
-            if len(ids) > max_length + 1:
-                dropped += 1
-                continue
-            kept.append(
-                {
-                    "ids": ids,
-                    "prompt_len": 1 + len(prompt),
-                    "length": len(ids) - 1,
-                    "task": row["task"],
-                    "source": row["source"],
-                    "n_executed": row["n_executed"],
-                }
-            )
-        if dropped:
-            logging.warning(
-                f"sft {split}: dropped {dropped}/{len(rows)} rows over max_length {max_length}"
-            )
-        prepared[split] = kept
-    return prepared
+    # Split here rather than at generation: partitioning one pass into two collections
+    # means buffering one of them, which an arrow filter does not.
+    return {
+        "test": prepared.filter(lambda b: b["is_test"], batched=True),
+        "train": prepared.filter(lambda b: [not v for v in b["is_test"]], batched=True),
+    }
 
 
 def prepare_rl(ds_raw, tokenizer, config):

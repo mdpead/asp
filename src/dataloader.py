@@ -78,15 +78,24 @@ class TokenSampler(Sampler):
         self.batches = self.generate_batches(ds)
 
     def generate_batches(self, ds):
-        # Position in the list is the index the DataLoader will ask for. `length` is the
-        # model input length prepare_sft recorded for exactly this purpose.
-        order = sorted(range(len(ds)), key=lambda i: ds[i]["length"])
+        # Read `length` as a whole column where the dataset offers one. Row-at-a-time
+        # access on an arrow-backed dataset materialises each row through Python — about
+        # 70us apiece, so tens of seconds over a corpus this runs over twice. Plain lists
+        # of dicts have no column to read, hence the fallback.
+        if hasattr(ds, "column_names"):
+            lengths = list(ds["length"])
+        else:
+            lengths = [row["length"] for row in ds]
+
+        # Position in the dataset is the index the DataLoader will ask for. `length` is
+        # the model input length prepare_sft recorded for exactly this purpose.
+        order = sorted(range(len(lengths)), key=lengths.__getitem__)
 
         batches = []
         batch = []
         longest = 0
         for idx in order:
-            length = ds[idx]["length"]
+            length = lengths[idx]
             # A row longer than the whole budget still gets its own batch rather than
             # being dropped — prepare_sft already dropped what does not fit the context.
             if max(longest, length) * (len(batch) + 1) > self.token_batch_size and batch:
