@@ -1,4 +1,4 @@
-name: base_5070ti
+name: base
 seed: 0
 
 # Sized for a 16GB card (RTX 5070 Ti desktop). The laptop config is memory-bound at 8GB;

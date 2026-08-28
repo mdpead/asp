@@ -26,7 +26,7 @@ def get_stage_path(config, stage):
 def parse_config():
     """--config <name> -> the parsed configs/<name>.yaml. Shared by the stage scripts."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True, help="Config name (e.g. base_5070ti, test)")
+    parser.add_argument("--config", required=True, help="Config name (e.g. base, test)")
     args = parser.parse_args()
     with open(f"configs/{args.config}.yaml") as f:
         return yaml.safe_load(f)
