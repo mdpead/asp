@@ -3,8 +3,8 @@ import logging
 
 
 # Reinforcement learning on synth tasks with verifiable rewards: sample rollouts from a
-# prompt, score them by executing the generated function, update on the advantage. Runs the
-# data path today; the rollout loop is not wired up yet — see the TODOs at the bottom.
+# prompt, score them by executing the generated function, update on the group-relative
+# advantage (GRPO). See src/rl.py for the loop.
 def main():
 
     logging.basicConfig(level=logging.INFO)
@@ -30,20 +30,10 @@ def main():
         dataloaders,
         token,
         config,
-        init_from=utils.get_stage_path(config, "pretrain"),
+        # From SFT, not pretrain: a pretrained model never emits the answer marker, so
+        # every reward is 0, every advantage is 0, and there is no gradient to follow.
+        init_from=utils.get_stage_path(config, "sft"),
     )
-
-    # TODO the loop itself. This is not train.train(): there are no fixed targets, so it is
-    # generate a group of K rollouts per prompt -> score each with
-    # synth.check_output_answer / check_input_answer -> group-relative advantage -> policy
-    # gradient step. GRPO fits, since the rewards are binary and verifiable and no value
-    # network is needed.
-
-    # Initialising from the SFT checkpoint is available now: pass
-    # init_from=utils.get_stage_path(config, "sft") and set train.rl.init_from_step,
-    # the same way scripts/sft.py starts from pretrain.
-
-    logging.warning("RL data path ran; the rollout loop is not wired up yet (see TODOs)")
 
 
 if __name__ == "__main__":
