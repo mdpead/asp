@@ -76,8 +76,16 @@ class MixtureOfExpertsFeedForward(nn.Module):
         token_expert_seat = rank_km.reshape(self.top_k, route_ind.shape[0], self.num_experts).permute(1, 0, 2) # (n, k, e)
         token_choice_seat = token_expert_seat.gather(-1, route_ind.unsqueeze(-1)).squeeze(-1) # (n, k)
 
-        # Capacity
-        capacity = int(self.capacity_factor * n * self.top_k/self.num_experts)
+        # Capacity. Only training drops: it is there to bound the padded expert compute of a
+        # large batch, and at inference it costs more than it saves. A cached decode step
+        # has n = batch, so at batch 1 the formula gives int(0.625) = 0 seats and every
+        # token skips every expert; at any small batch, whether a token keeps its expert
+        # depends on what it was batched with. n seats is the worst case — each token picks
+        # top_k distinct experts — so nothing can overflow.
+        if self.training:
+            capacity = int(self.capacity_factor * n * self.top_k / self.num_experts)
+        else:
+            capacity = n
         # A pad never keeps its seat, so the same branch sends it to the bin below and
         # zeroes its gate — one condition covering both overflow and padding.
         keep = (token_choice_seat < capacity) & real
@@ -402,7 +410,15 @@ class Transformer(nn.Module):
         seq_starts: Tensor | None = None,
         kv_cache: Tensor | None = None,
         padding_mask: Tensor | None = None,
+        output_mask: Tensor | None = None,
     ):
+        """`output_mask` is (batch, seq) bool: project only those positions to the vocabulary.
+
+        The logits then come back as (selected, vocab), in row-major order, rather than
+        (batch, seq, vocab). For callers that score a subset of positions — RL reads only a
+        rollout's completion — the full tensor is the largest allocation in the pass and
+        most of it is discarded, along with the gradient memory behind it.
+        """
         # Training right-pads, where causal masking already excludes pad keys, so no
         # leading padding to skip. Left-padded generation passes real offsets.
         if seq_starts is None:
@@ -410,6 +426,8 @@ class Transformer(nn.Module):
 
         x_emb = self.dropout(self.embedding(x))
         x_dec, loss_aux, new_kv = self.decoder(x_emb, seq_starts, kv_cache, padding_mask)
+        if output_mask is not None:
+            x_dec = x_dec[output_mask]
         out = torch.matmul(x_dec, self.embedding.E.T)
         # Cache-free callers (training) keep the two-tuple contract they already use
         if kv_cache is None:
