@@ -36,6 +36,36 @@ class WarmupInverseSquareRootLR(LRScheduler):
         return lrs
 
 
+class WarmupConstantLR(LRScheduler):
+    """Linear warmup to the base rate, then held there.
+
+    For RL, where decay works against the stage: the policy keeps generating new data, so
+    late steps are no less informative than early ones, and a rate that shrinks as
+    1/sqrt(step) leaves a long run learning almost nothing by its end.
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warm_up_steps: int,
+        last_epoch: int = -1,
+    ) -> None:
+
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+        self.warm_up_steps = warm_up_steps
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self) -> list[float]:
+        scale = min(1.0, (self.last_epoch + 1) / self.warm_up_steps)
+        return [base_lr * scale for base_lr in self.base_lrs]
+
+
+_LR_SCHEDULES = {
+    "inverse_sqrt": WarmupInverseSquareRootLR,
+    "constant": WarmupConstantLR,
+}
+
+
 def validation_step(
     model, dataloader, criterion, device, tokenizer, step_no, max_length, validation_minibatches
 ):
@@ -314,7 +344,9 @@ def create_training_objects(model, train_config, tokenizer):
         weight_decay=0.01,
     )
 
-    lr_scheduler = WarmupInverseSquareRootLR(optimiser, train_config["warm_up_steps"])
+    # Defaulted, so the stages that predate the key keep the schedule they were trained with
+    schedule = _LR_SCHEDULES[train_config.get("lr_schedule", "inverse_sqrt")]
+    lr_scheduler = schedule(optimiser, train_config["warm_up_steps"])
 
     scaler = amp.GradScaler()
 
