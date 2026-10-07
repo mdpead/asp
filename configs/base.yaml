@@ -88,6 +88,56 @@ train:
     init_from_step: 10000          # the only trained checkpoint besides 5000, and pretrain
                                    # is 29% done — these weights are not final
 
+  rl:
+    # Untuned. Every value here is a starting point taken from short trials on an earlier
+    # checkpoint, where 60 steps moved nothing on the full prompt set and 15 steps on 16
+    # hand-picked prompts took sampled reward from 30% to 88%. The loop learns when a
+    # prompt's rollouts disagree, and whether they do depends on the SFT model, so watch
+    # mixed_group_rate before reading anything into a flat curve.
+    minibatch_prompts_size: 4      # x rollouts_per_group = 32 rows generated together.
+                                   # Sized for generation, which holds no gradients; the
+                                   # rescore is bounded separately below.
+    effective_prompts_size: 64     # 16 accumulation steps, 512 rollouts generated per update.
+                                   # Only groups whose rollouts disagree are trained on —
+                                   # about a fifth on a model that is mostly right — so the
+                                   # count is sized for what survives, not what is sampled.
+    rollouts_per_group: 8
+    rescore_token_size: 4096       # padded tokens per rescore-and-backward, the same
+                                   # budget as sft's minibatch_token_size and the same
+                                   # memory per token. A rollout's length is not known
+                                   # until it is generated, so the cap is applied after
+                                   # sampling, by splitting the rows. 32 rows x 204 tokens
+                                   # peaked at 12.0GB in one pass and 8.2GB under this.
+    learning_rate: 1.0e-5
+    lr_schedule: constant          # no decay: the policy keeps making new data, so late
+                                   # steps matter as much as early ones
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 300
+    max_new_tokens: 256            # an easy-tier traced completion runs well under this;
+                                   # a rollout that rambles to the limit pads its whole
+                                   # generation batch out with it
+    temperature: 1.0               # above 1.0 buys more disagreement within a group, the
+                                   # first thing to try if mixed_group_rate is low. The
+                                   # rescore divides by it too, so the update stays the
+                                   # gradient of the policy as sampled.
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 50           # 4.2GB each; the final step saves regardless
+    keep_checkpoints: 2
+    warm_up_steps: 10
+    validation_steps: 25
+    validation_prompts_size: 32    # no gradients held, so larger than the training minibatch
+    validation_batches: 13         # in batches of validation_prompts_size: the whole
+                                   # ~400-prompt test split
+    validation_samples: 2          # rollouts per test prompt for sampled_reward. Fewer
+                                   # per prompt and more prompts: the noise that matters is
+                                   # across functions, not across draws of one
+    compile_model: false           # generation changes sequence length every decode step
+    cache_clear_steps: 1           # generation and the rescore allocate very different
+                                   # shapes back to back, and the card has little headroom
+    init_from_step: 200            # sft's final step
+
 data:
   pretrain:
     test_split_ratio: 0.001
@@ -109,6 +159,17 @@ data:
     tasks: [output]
     inputs_per_fn: 4
     with_trace: true
+    test_split_ratio: 0.05
+
+  rl:
+    num_records: 8000       # ~7,600 train / ~400 test prompts, from their own seed so they
+                            # are not the functions sft trained on. Sized for the test
+                            # split: each function appears under 4 inputs, so 400 prompts
+                            # is ~100 independent functions, and the first run's 93 prompts
+                            # over 24 functions could not tell a 3-point gain from noise.
+    tier: easy
+    tasks: [output]
+    inputs_per_fn: 4
     test_split_ratio: 0.05
 
 tokenizer:

@@ -69,6 +69,10 @@ train:
     minibatch_prompts_size: 4
     effective_prompts_size: 8
     rollouts_per_group: 8
+    rescore_token_size: 2048        # padded tokens per rescore-and-backward. Rollout
+                                    # lengths are only known after sampling, so rows are
+                                    # split to fit rather than batched to fit. 32 rows x
+                                    # 256 here, so this exercises the split.
     learning_rate: 1.0e-6           # an order under sft, the same way sft sits under
                                     # pretrain. RL updates on its own samples, so a step
                                     # large enough to shift the policy sharply changes the
@@ -89,11 +93,15 @@ train:
     device: cuda
     checkpoint_steps: 50
     keep_checkpoints: 2
-    warm_up_steps: 2                # not 0: WarmupInverseSquareRootLR takes the else branch
-                                    # at step 0 and computes base_lr * 0**0.5, which is a
-                                    # zero learning rate for the whole run.
+    warm_up_steps: 2                # not 0: both schedules divide by it
+    lr_schedule: constant           # no decay: the policy keeps making new data, so late
+                                    # steps matter as much as early ones
     validation_steps: 20
-    validation_batches: 1
+    validation_prompts_size: 8      # prompts per validation batch; no gradients are held,
+                                    # so it can exceed minibatch_prompts_size
+    validation_batches: 1           # in batches of validation_prompts_size
+    validation_samples: 8           # rollouts per test prompt for sampled_reward, at the
+                                    # training temperature. Defaults to rollouts_per_group.
     compile_model: false            # generation changes sequence length every decode step,
                                     # which fullgraph=True cannot hold across.
                                     # No num_workers or prefetch_factor: both exist to

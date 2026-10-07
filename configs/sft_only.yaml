@@ -68,6 +68,42 @@ train:
     prefetch_factor: 4
     init_from_step: 0          # the untrained checkpoint the zero-step pretrain wrote
 
+  rl:
+    # Untuned, as in base. This is the first checkpoint in the current answer format with
+    # enough sft behind it to answer at all, so it is where the rl loop gets tried on the
+    # real path before a full base run is paid for.
+    minibatch_prompts_size: 4      # x rollouts_per_group = 32 rows generated together
+    effective_prompts_size: 64     # 16 accumulation steps, 512 rollouts generated per update.
+                                   # Only groups whose rollouts disagree are trained on —
+                                   # about a fifth on a model that is mostly right — so the
+                                   # count is sized for what survives, not what is sampled.
+    rollouts_per_group: 8
+    rescore_token_size: 2048       # padded tokens per rescore-and-backward. Half of
+                                   # base's, for the reason sft's minibatch is: this
+                                   # config has already shown it has no headroom at 4096.
+    learning_rate: 1.0e-5
+    lr_schedule: constant
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 100
+    max_new_tokens: 256
+    temperature: 1.0
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 20           # 4.2GB each
+    keep_checkpoints: 1
+    warm_up_steps: 5
+    validation_steps: 25
+    validation_prompts_size: 32    # no gradients held, so larger than the training minibatch
+    validation_batches: 13         # in batches of validation_prompts_size: the whole
+                                   # ~400-prompt test split
+    validation_samples: 2          # rollouts per test prompt for sampled_reward. Fewer
+                                   # per prompt and more prompts: the noise that matters is
+                                   # across functions, not across draws of one
+    compile_model: false
+    cache_clear_steps: 1
+    init_from_step: 10000          # sft's final step
+
 data:
   pretrain:
     test_split_ratio: 0.001
@@ -84,6 +120,17 @@ data:
     inputs_per_fn: 4
     with_trace: true
     test_split_ratio: 0.02
+
+  rl:
+    num_records: 8000       # ~7,600 train / ~400 test prompts, from their own seed so they
+                            # are not the functions sft trained on. Sized for the test
+                            # split: each function appears under 4 inputs, so 400 prompts
+                            # is ~100 independent functions, and the first run's 93 prompts
+                            # over 24 functions could not tell a 3-point gain from noise.
+    tier: easy
+    tasks: [output]
+    inputs_per_fn: 4
+    test_split_ratio: 0.05
 
 tokenizer:
   vocab_size: 32000

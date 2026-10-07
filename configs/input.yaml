@@ -1,0 +1,108 @@
+name: input
+seed: 0
+
+# Input prediction: given a function and a result, find arguments that produce it. The
+# task where rl has something to offer that sft does not. Many argument sets are usually
+# correct — a variable overwritten on the first line can take any value — but sft is shown
+# one arbitrary choice per example and penalised for every other, while the rl reward
+# accepts whatever the function confirms.
+#
+# Starts from the sft_only model, which already traces execution forwards, rather than
+# from scratch: this run is about the last stage, and five hours of sft to relearn tracing
+# would tell it nothing. There is no pretrain stage here to produce those weights, so the
+# run directory is seeded by hand before the first run:
+#
+#   mkdir -p models/input/pretrain/checkpoints
+#   ln -s "$(realpath models/sft_only/sft/checkpoints/10000.pt)" models/input/pretrain/checkpoints/10000.pt
+#   cp -r models/sft_only/tokenizer models/input/tokenizer
+#
+# sft then initialises from models/input/pretrain the way every config's sft does. The
+# model and tokenizer sections must stay identical to sft_only's for those weights to load.
+model:
+  d_model: 1024
+  num_heads: 16
+  num_kv_heads: 4
+  d_h: 64
+  max_length: 1024
+  d_ff: 1408
+  num_experts: 4
+  top_k: 2
+  capacity_factor: 1.25
+  num_layers: 16
+  dropout: 0.0
+
+train:
+  sft:
+    effective_batch_token_size: 32768
+    minibatch_token_size: 2048     # as sft_only: no headroom at 4096 on ragged batches
+    learning_rate: 1.0e-4          # a third of sft_only's: a fine-tune off weights that
+                                   # already trace, not a start from random
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 1000                # ~33M tokens, about one pass over data.sft
+    label_smoothing: 0.0
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 500          # 4.2GB each
+    keep_checkpoints: 2
+    warm_up_steps: 50
+    validation_steps: 100
+    validation_batches: 1
+    compile_model: false
+    num_workers: 8
+    prefetch_factor: 4
+    init_from_step: 10000          # sft_only's final sft step, linked in as described above
+
+  rl:
+    # Untuned; the same values as sft_only's rl stage, so the two runs differ in the task
+    minibatch_prompts_size: 4      # x rollouts_per_group = 32 rows generated together
+    effective_prompts_size: 64     # 16 accumulation steps, 512 rollouts generated per
+                                   # update; only groups whose rollouts disagree are
+                                   # trained on
+    rollouts_per_group: 8
+    rescore_token_size: 2048       # padded tokens per rescore-and-backward
+    learning_rate: 1.0e-5
+    lr_schedule: constant
+    adam_betas: [0.9, 0.95]
+    adam_eps: 1.0e-8
+    num_steps: 100
+    max_new_tokens: 256
+    temperature: 1.0
+    router_aux_loss_coef: 0.01
+    device: cuda
+    checkpoint_steps: 20           # 4.2GB each
+    keep_checkpoints: 1
+    warm_up_steps: 5
+    validation_steps: 25
+    validation_prompts_size: 32
+    validation_batches: 13         # the whole ~400-prompt test split
+    validation_samples: 2
+    compile_model: false
+    cache_clear_steps: 1
+    init_from_step: 1000           # sft's final step
+
+data:
+  sft:
+    num_records: 250000     # ~240k train rows at ~135 tokens: about one pass in 1000 steps
+    tier: easy
+    tasks: [input]
+    inputs_per_fn: 4
+    with_trace: true        # the trace runs forwards from the arguments the answer then
+                            # states, so the model commits to a guess and checks it
+    test_split_ratio: 0.02
+
+  rl:
+    num_records: 8000       # ~7,600 train / ~400 test prompts, from their own seed
+    tier: easy
+    tasks: [input]
+    inputs_per_fn: 4
+    test_split_ratio: 0.05
+
+tokenizer:
+  vocab_size: 32000
+  training_size: 50000
+  digit_split: true
+
+locations:
+  data_dir: ./data
+  models_dir: ./models
