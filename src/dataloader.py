@@ -314,8 +314,13 @@ def create_dataloaders_rl(
         else:
             # One bounded pass in dataset order: a pass-rate is only comparable across
             # steps if every measurement runs on the same prompts, and an infinite
-            # sampler here would make `for batch in loader` hang instead.
-            batching = {"batch_size": train_config["minibatch_prompts_size"], "shuffle": False}
+            # sampler here would make `for batch in loader` hang instead. Its own size,
+            # because validation holds no gradients: the training minibatch is sized for
+            # the rescore's activations, and decoding at that size leaves the GPU idle.
+            batch_size = train_config.get(
+                "validation_prompts_size", train_config["minibatch_prompts_size"]
+            )
+            batching = {"batch_size": batch_size, "shuffle": False}
 
         dataloaders[split] = DataLoader(
             ds[split],

@@ -159,8 +159,12 @@ def get_dataset_rl(config):
     """
     ds_config = config["data"]["rl"]
 
+    # A seed of its own, so these are not the functions sft trained on. A model that has
+    # been shown a function's answers can score on recall, and a reward for recall teaches
+    # nothing about computing the result. Two streams can still write the same small
+    # function by chance; that is rare enough to leave alone.
     rows = []
-    for record in _synth_records(ds_config, config["seed"], with_trace=False):
+    for record in _synth_records(ds_config, config["seed"] + 1, with_trace=False):
         for task in ds_config["tasks"]:
             prompt, _ = _TASK_FORMATTERS[task](record, False)
             rows.append(
