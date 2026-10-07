@@ -18,6 +18,20 @@ def make_kv_cache(model, batches, seq_length, device):
     return kv_cache
 
 
+def blocked_token_ids(tokenizer, device):
+    """Ids sampling never draws: <bos>, <pad> and <unk>.
+
+    Framing generate writes and decoding strips, so sampling one would train on a token
+    that never appears in the text being scored. <eos> is deliberately not here: stopping
+    is a real choice, and masking it off is how a model learns to never stop.
+
+    Its own function because the policy gradient has to rescore rollouts under exactly the
+    distribution they were drawn from, and that distribution has these removed.
+    """
+    blocked = [tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer.unk_token_id]
+    return torch.tensor([i for i in blocked if i is not None], device=device)
+
+
 def generate(model, tokenizer, input_texts, device, max_new_tokens=None, temperature=0):
     """Continue each prompt, returning (token_ids, completion_mask, logprobs, seq_starts,
     finished).
@@ -93,11 +107,7 @@ def generate(model, tokenizer, input_texts, device, max_new_tokens=None, tempera
     completion_mask = torch.zeros_like(token_ids, dtype=torch.bool)
     logprobs = torch.zeros_like(token_ids, dtype=torch.float32) if temperature > 0 else None
 
-    # Framing this function writes and decoding strips, so sampling one would train on a
-    # token that never appears in the text being scored. <eos> is deliberately not here:
-    # stopping is a real choice, and masking it off is how a model learns to never stop.
-    blocked = [tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer.unk_token_id]
-    blocked = torch.tensor([i for i in blocked if i is not None], device=device)
+    blocked = blocked_token_ids(tokenizer, device)
 
     # Make kv cache
     kv_cache = make_kv_cache(model, batch_size, input_length + new_tokens, device)
