@@ -112,7 +112,8 @@ def test_moe_matches_naive_dispatch_when_nothing_is_dropped(make_model, tokenize
 
 def test_moe_capacity_drops_only_the_overflow(make_model, tokenizer):
     """At capacity 1.0 some assignments are dropped, and only those lose their expert."""
-    tight = make_model(len(tokenizer), capacity_factor=1.0)
+    # Train mode, since only training enforces capacity
+    tight = make_model(len(tokenizer), capacity_factor=1.0).train()
     moe_tight = tight.decoder.decoder_layers[0].feedforward
     moe_loose = make_model(len(tokenizer), capacity_factor=4.0).decoder.decoder_layers[0].feedforward
     moe_loose.load_state_dict(moe_tight.state_dict())
@@ -176,7 +177,7 @@ def test_padding_content_cannot_reach_real_tokens(make_model, tokenizer):
     content differs. Checks every position — mid-sequence is where the effect appears,
     and the final position alone can pass by luck.
     """
-    moe = make_model(len(tokenizer), capacity_factor=1.0).decoder.decoder_layers[0].feedforward
+    moe = make_model(len(tokenizer), capacity_factor=1.0).train().decoder.decoder_layers[0].feedforward
     real = torch.randn(1, 24, 64, device=DEV, dtype=torch.float16)
     mask = torch.zeros(1, 64, dtype=torch.bool, device=DEV)
     mask[:, :24] = True
@@ -212,7 +213,7 @@ def test_padding_is_invisible_when_capacity_cannot_bind(make_model, tokenizer):
 
 def test_unmasked_padding_does_perturb_real_tokens(make_model, tokenizer):
     """The converse, so the tests above cannot pass for the wrong reason."""
-    moe = make_model(len(tokenizer), capacity_factor=1.0).decoder.decoder_layers[0].feedforward
+    moe = make_model(len(tokenizer), capacity_factor=1.0).train().decoder.decoder_layers[0].feedforward
     real = torch.randn(1, 24, 64, device=DEV, dtype=torch.float16)
     padded = torch.cat([real, torch.randn(1, 40, 64, device=DEV, dtype=torch.float16)], dim=1)
 
@@ -221,3 +222,32 @@ def test_unmasked_padding_does_perturb_real_tokens(make_model, tokenizer):
 
     err = (unmasked[0, :24].float() - plain[0].float()).abs().max().item()
     assert err > 0.0, "expected unmasked padding to contend for expert capacity"
+
+
+def test_inference_never_drops_a_token(make_model, tokenizer):
+    """A single-token decode step keeps its experts, at a capacity that would drop it.
+
+    The formula gives int(1.0 * 1 * 2 / 4) = 0 seats for one token, so enforcing capacity
+    at inference turns every cached decode step at batch 1 into a residual-only pass.
+    """
+    m = make_model(len(tokenizer), capacity_factor=1.0)
+    moe = m.decoder.decoder_layers[0].feedforward
+    x = torch.randn(1, 1, 64, device=DEV, dtype=torch.float16)
+
+    got, _ = moe(x)
+    assert torch.equal(got, _reference_moe(moe, x))
+    assert got.abs().sum() > 0, "the token lost every expert"
+
+
+def test_output_mask_projects_only_the_selected_positions(model, tokenizer):
+    """Masked logits are the full logits at those positions, in row-major order."""
+    x = torch.randint(4, len(tokenizer), (3, 10), device=DEV)
+    mask = torch.zeros(3, 10, dtype=torch.bool, device=DEV)
+    mask[0, 2:5] = True
+    mask[2, 7:] = True
+
+    full, _ = model(x)
+    selected, _ = model(x, output_mask=mask)
+
+    assert selected.shape == (int(mask.sum()), len(tokenizer))
+    assert torch.equal(selected, full[mask])

@@ -131,3 +131,23 @@ def test_rows_longer_than_the_context_are_dropped(tokenizer):
     kept_tight = len(tight["train"]) + len(tight["test"])
     assert 0 < kept_tight < len(lengths)
     assert all(n <= bound for n in tight["train"]["length"])
+
+
+
+def test_rl_prompts_are_not_the_sft_functions(tokenizer):
+    """RL scores answers, so functions sft showed the answers to would reward recall."""
+    cfg = _config(tokenizer, 400)
+    cfg["data"]["rl"] = {
+        "num_records": 200, "tier": "easy", "tasks": ["output"],
+        "inputs_per_fn": 4, "test_split_ratio": 0.1,
+    }
+
+    def rl_sources():
+        return {row["source"] for rows in data.get_dataset_rl(cfg).values() for row in rows}
+
+    sft_sources = {r["source"] for r in data._synth_records(cfg["data"]["sft"], cfg["seed"], True)}
+
+    assert rl_sources(), "rl generated nothing"
+    # Chance collisions between the two streams are allowed; sharing a stream is not
+    assert len(rl_sources() & sft_sources) < 0.05 * len(rl_sources())
+    assert rl_sources() == rl_sources(), "rl data is not deterministic"

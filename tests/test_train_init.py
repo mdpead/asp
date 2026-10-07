@@ -232,3 +232,18 @@ def test_a_later_stage_initialises_from_the_zero_step_checkpoint(
         target, utils.get_stage_path(cfg, "pretrain"), torch.device(DEV), step=0
     )
     assert torch.equal(_first_param(target), _first_param(source))
+
+
+@pytest.mark.parametrize("schedule, decays", [("inverse_sqrt", True), ("constant", False)])
+def test_lr_schedule_is_chosen_by_config(make_model, tokenizer, schedule, decays):
+    tc = {"device": DEV, "learning_rate": 1e-3, "adam_betas": [0.9, 0.95], "adam_eps": 1e-8,
+          "warm_up_steps": 4, "lr_schedule": schedule}
+    _, opt, sched, _ = train.create_training_objects(make_model(len(tokenizer)).float(), tc, tokenizer)
+    lrs = []
+    for _ in range(20):
+        opt.step()
+        sched.step()
+        lrs.append(sched.get_last_lr()[0])
+    assert lrs[0] < max(lrs), "warmup should ramp up"
+    assert max(lrs) == pytest.approx(1e-3)
+    assert (lrs[-1] < max(lrs)) == decays
